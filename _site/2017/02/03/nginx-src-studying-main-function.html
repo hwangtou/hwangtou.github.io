@@ -1,0 +1,1593 @@
+<p>#運行文件和啟動流程（草稿）</p>
+
+<p>nginx執行的main函數位於src/core/nginx.c源文件中。</p>
+
+<p>##1.	函數變量的統一聲明</p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/core/nginx.c 187~195
+</span>
+<span class="kt">int</span> <span class="n">ngx_cdecl</span>
+<span class="nf">main</span><span class="p">(</span><span class="kt">int</span> <span class="n">argc</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="k">const</span> <span class="o">*</span><span class="n">argv</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="n">ngx_buf_t</span>        <span class="o">*</span><span class="n">b</span><span class="p">;</span>
+    <span class="n">ngx_log_t</span>        <span class="o">*</span><span class="n">log</span><span class="p">;</span>
+    <span class="n">ngx_uint_t</span>        <span class="n">i</span><span class="p">;</span>
+    <span class="n">ngx_cycle_t</span>      <span class="o">*</span><span class="n">cycle</span><span class="p">,</span> <span class="n">init_cycle</span><span class="p">;</span>
+    <span class="n">ngx_conf_dump_t</span>  <span class="o">*</span><span class="n">cd</span><span class="p">;</span>
+    <span class="n">ngx_core_conf_t</span>  <span class="o">*</span><span class="n">ccf</span><span class="p">;</span>
+</code></pre>
+</div>
+
+<p>第190～195行，先是定義一系列的變量，因為為了兼容舊版本C編譯器的標準，避免for循環初始條件中聲明變量等問題，nginx在將在函數中使用到的所有變量都先在函數定義的開始進行聲明。</p>
+
+<p>##2. ngx_debug_init()</p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/core/nginx.c 197
+</span>
+    <span class="n">ngx_debug_init</span><span class="p">();</span>
+</code></pre>
+</div>
+
+<p>第197行，調用ngx_debug_init()函數，這是一個非常有趣的內存debug函數，其會為malloc申請到的和free釋放了的堆空間填充特定的字節，那麼在內存調試的時候，就可以通過內存內容知道該內存空間是剛被申請的，或者已被使用過的，還是已經被銷毀的。</p>
+
+<p>而在不同的平台，有不同的實現方法，如圖為os/unix/ngx_darwin_init.c即darwin內核操作系統的實現方法，通過設置環境變量MallocScribble為字符串1的方法來實現，而其註釋中也說明在不同的Mac OS X版本中對內存的填充效果也有所不同。然後根據是否為內存填充debug模式來設定ngx_debug_malloc的值。</p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/os/unix/ngx_darwin_init.c 63~88
+</span>
+<span class="kt">void</span>
+<span class="nf">ngx_debug_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="cp">#if (NGX_DEBUG_MALLOC)
+</span>
+    <span class="cm">/*
+     * MacOSX 10.6, 10.7:  MallocScribble fills freed memory with 0x55
+     *                     and fills allocated memory with 0xAA.
+     * MacOSX 10.4, 10.5:  MallocScribble fills freed memory with 0x55,
+     *                     MallocPreScribble fills allocated memory with 0xAA.
+     * MacOSX 10.3:        MallocScribble fills freed memory with 0x55,
+     *                     and no way to fill allocated memory.
+     */</span>
+
+    <span class="n">setenv</span><span class="p">(</span><span class="s">"MallocScribble"</span><span class="p">,</span> <span class="s">"1"</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+
+    <span class="n">ngx_debug_malloc</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+<span class="cp">#else
+</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">getenv</span><span class="p">(</span><span class="s">"MallocScribble"</span><span class="p">))</span> <span class="p">{</span>
+        <span class="n">ngx_debug_malloc</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+    <span class="p">}</span>
+
+<span class="cp">#endif
+</span><span class="p">}</span>
+</code></pre>
+</div>
+
+<p>ngx_debug_init()函數之於FreeBSD操作系統如圖，代碼的精神大同小異，而FreeBSD操作系統提供了特殊的全局變量malloc_option，根據不同的版本而不同，而字符串J則是malloc_option的flag，不同的flag有不同的意義，而J則會令所有通過malloc和realloc申請的內存的每一個字節都會被初始化為0xA5，free釋放的內存也是如此。</p>
+
+<p>而在Linux或其它平台的定義中，則是用宏定義直接把ngx_debug_init()直接丟棄，或許是這類型的系統沒有類似的實現方法吧。</p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/os/unix/ngx_freebsd_init.c 76~98
+</span>
+<span class="kt">void</span>
+<span class="nf">ngx_debug_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="cp">#if (NGX_DEBUG_MALLOC)
+</span>
+<span class="cp">#if __FreeBSD_version &gt;= 500014 &amp;&amp; __FreeBSD_version &lt; 1000011
+</span>    <span class="n">_malloc_options</span> <span class="o">=</span> <span class="s">"J"</span><span class="p">;</span>
+<span class="cp">#elif __FreeBSD_version &lt; 500014
+</span>    <span class="n">malloc_options</span> <span class="o">=</span> <span class="s">"J"</span><span class="p">;</span>
+<span class="cp">#endif
+</span>
+    <span class="n">ngx_debug_malloc</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+<span class="cp">#else
+</span>    <span class="kt">char</span>  <span class="o">*</span><span class="n">mo</span><span class="p">;</span>
+
+    <span class="n">mo</span> <span class="o">=</span> <span class="n">getenv</span><span class="p">(</span><span class="s">"MALLOC_OPTIONS"</span><span class="p">);</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">mo</span> <span class="o">&amp;&amp;</span> <span class="n">ngx_strchr</span><span class="p">(</span><span class="n">mo</span><span class="p">,</span> <span class="sc">'J'</span><span class="p">))</span> <span class="p">{</span>
+        <span class="n">ngx_debug_malloc</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+    <span class="p">}</span>
+<span class="cp">#endif
+</span><span class="p">}</span>
+</code></pre>
+</div>
+
+<p>而在Linux或其它平台的定義中，則是用宏定義直接把ngx_debug_init()直接丟棄，或許是這類型的系統沒有類似的實現方法吧。</p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/os/unix/ngx_linux_config.h 117
+</span>
+<span class="cp">#define ngx_debug_init()
+</span></code></pre>
+</div>
+
+<p>##3. ngx_strerror_init()與ngx_errno</p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/core/nginx.c 199~201
+</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">ngx_strerror_init</span><span class="p">()</span> <span class="o">!=</span> <span class="n">NGX_OK</span><span class="p">)</span> <span class="p">{</span>
+        <span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+    <span class="p">}</span>
+</code></pre>
+</div>
+
+<p>第198～200行，nginx調用ngx_strerror_init()函數，其作用是初始化nginx的errno描述功能，當ngx_strerrno_init()函數成功調用之後，使用者就可以通過ngx_strerror()方法，獲得errno對應的錯誤描述字符串。
+在ngx_errno.h中，有一系列的errno宏定義，把系統的errno變成nginx的內部表達，同時也用條件編譯的方法來解決不同平台的errno差異，如HP Unix平台下的EAGAIN問題。</p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/os/unix/ngx_errno.h 16~56
+</span>
+<span class="cp">#define NGX_EPERM         EPERM
+#define NGX_ENOENT        ENOENT
+#define NGX_ENOPATH       ENOENT
+#define NGX_ESRCH         ESRCH
+#define NGX_EINTR         EINTR
+#define NGX_ECHILD        ECHILD
+#define NGX_ENOMEM        ENOMEM
+#define NGX_EACCES        EACCES
+#define NGX_EBUSY         EBUSY
+#define NGX_EEXIST        EEXIST
+#define NGX_EEXIST_FILE   EEXIST
+#define NGX_EXDEV         EXDEV
+#define NGX_ENOTDIR       ENOTDIR
+#define NGX_EISDIR        EISDIR
+#define NGX_EINVAL        EINVAL
+#define NGX_ENFILE        ENFILE
+#define NGX_EMFILE        EMFILE
+#define NGX_ENOSPC        ENOSPC
+#define NGX_EPIPE         EPIPE
+#define NGX_EINPROGRESS   EINPROGRESS
+#define NGX_ENOPROTOOPT   ENOPROTOOPT
+#define NGX_EOPNOTSUPP    EOPNOTSUPP
+#define NGX_EADDRINUSE    EADDRINUSE
+#define NGX_ECONNABORTED  ECONNABORTED
+#define NGX_ECONNRESET    ECONNRESET
+#define NGX_ENOTCONN      ENOTCONN
+#define NGX_ETIMEDOUT     ETIMEDOUT
+#define NGX_ECONNREFUSED  ECONNREFUSED
+#define NGX_ENAMETOOLONG  ENAMETOOLONG
+#define NGX_ENETDOWN      ENETDOWN
+#define NGX_ENETUNREACH   ENETUNREACH
+#define NGX_EHOSTDOWN     EHOSTDOWN
+#define NGX_EHOSTUNREACH  EHOSTUNREACH
+#define NGX_ENOSYS        ENOSYS
+#define NGX_ECANCELED     ECANCELED
+#define NGX_EILSEQ        EILSEQ
+#define NGX_ENOMOREFILES  0
+#define NGX_ELOOP         ELOOP
+#define NGX_EBADF         EBADF
+</span>
+<span class="cp">#if (NGX_HAVE_OPENAT)
+#define NGX_EMLINK        EMLINK
+#endif
+</span>
+<span class="cp">#if (__hpux__)
+#define NGX_EAGAIN        EWOULDBLOCK
+#else
+#define NGX_EAGAIN        EAGAIN
+#endif
+</span></code></pre>
+</div>
+
+<p>在ngx_strerror_init函數中，NGX_SYS_NERR是在objs/ngx_auto_config.h中定義的系統errno最大數目，ngx_sys_errlist是源文件中的靜態變量，根據errno最大數目為其創建堆空間，作為ngx_str數組之用。迭代errno，然後用<string.h>中的strerror函數來獲得對應的錯誤提示，把其複製到新創建的字符串堆空間中，並把該字符串賦值到ngx\_sys\_errlist數組對應的errno位置中。</string.h></p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/os/unix/ngx_errno.h 16~56
+</span>
+<span class="cp">#define NGX_EPERM         EPERM
+#define NGX_ENOENT        ENOENT
+#define NGX_ENOPATH       ENOENT
+#define NGX_ESRCH         ESRCH
+#define NGX_EINTR         EINTR
+#define NGX_ECHILD        ECHILD
+#define NGX_ENOMEM        ENOMEM
+#define NGX_EACCES        EACCES
+#define NGX_EBUSY         EBUSY
+#define NGX_EEXIST        EEXIST
+#define NGX_EEXIST_FILE   EEXIST
+#define NGX_EXDEV         EXDEV
+#define NGX_ENOTDIR       ENOTDIR
+#define NGX_EISDIR        EISDIR
+#define NGX_EINVAL        EINVAL
+#define NGX_ENFILE        ENFILE
+#define NGX_EMFILE        EMFILE
+#define NGX_ENOSPC        ENOSPC
+#define NGX_EPIPE         EPIPE
+#define NGX_EINPROGRESS   EINPROGRESS
+#define NGX_ENOPROTOOPT   ENOPROTOOPT
+#define NGX_EOPNOTSUPP    EOPNOTSUPP
+#define NGX_EADDRINUSE    EADDRINUSE
+#define NGX_ECONNABORTED  ECONNABORTED
+#define NGX_ECONNRESET    ECONNRESET
+#define NGX_ENOTCONN      ENOTCONN
+#define NGX_ETIMEDOUT     ETIMEDOUT
+#define NGX_ECONNREFUSED  ECONNREFUSED
+#define NGX_ENAMETOOLONG  ENAMETOOLONG
+#define NGX_ENETDOWN      ENETDOWN
+#define NGX_ENETUNREACH   ENETUNREACH
+#define NGX_EHOSTDOWN     EHOSTDOWN
+#define NGX_EHOSTUNREACH  EHOSTUNREACH
+#define NGX_ENOSYS        ENOSYS
+#define NGX_ECANCELED     ECANCELED
+#define NGX_EILSEQ        EILSEQ
+#define NGX_ENOMOREFILES  0
+#define NGX_ELOOP         ELOOP
+#define NGX_EBADF         EBADF
+</span>
+<span class="cp">#if (NGX_HAVE_OPENAT)
+#define NGX_EMLINK        EMLINK
+#endif
+</span>
+<span class="cp">#if (__hpux__)
+#define NGX_EAGAIN        EWOULDBLOCK
+#else
+#define NGX_EAGAIN        EAGAIN
+#endif
+</span></code></pre>
+</div>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/os/unix/ngx_errno.c 45~87
+</span>
+<span class="n">ngx_int_t</span>
+<span class="nf">ngx_strerror_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="kt">char</span>       <span class="o">*</span><span class="n">msg</span><span class="p">;</span>
+    <span class="n">u_char</span>     <span class="o">*</span><span class="n">p</span><span class="p">;</span>
+    <span class="kt">size_t</span>      <span class="n">len</span><span class="p">;</span>
+    <span class="n">ngx_err_t</span>   <span class="n">err</span><span class="p">;</span>
+
+    <span class="cm">/*
+     * ngx_strerror() is not ready to work at this stage, therefore,
+     * malloc() is used and possible errors are logged using strerror().
+     */</span>
+
+    <span class="n">len</span> <span class="o">=</span> <span class="n">NGX_SYS_NERR</span> <span class="o">*</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">ngx_str_t</span><span class="p">);</span>
+
+    <span class="n">ngx_sys_errlist</span> <span class="o">=</span> <span class="n">malloc</span><span class="p">(</span><span class="n">len</span><span class="p">);</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">ngx_sys_errlist</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+        <span class="k">goto</span> <span class="n">failed</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="k">for</span> <span class="p">(</span><span class="n">err</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">err</span> <span class="o">&lt;</span> <span class="n">NGX_SYS_NERR</span><span class="p">;</span> <span class="n">err</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">msg</span> <span class="o">=</span> <span class="n">strerror</span><span class="p">(</span><span class="n">err</span><span class="p">);</span>
+        <span class="n">len</span> <span class="o">=</span> <span class="n">ngx_strlen</span><span class="p">(</span><span class="n">msg</span><span class="p">);</span>
+
+        <span class="n">p</span> <span class="o">=</span> <span class="n">malloc</span><span class="p">(</span><span class="n">len</span><span class="p">);</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">p</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+            <span class="k">goto</span> <span class="n">failed</span><span class="p">;</span>
+        <span class="p">}</span>
+
+        <span class="n">ngx_memcpy</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">msg</span><span class="p">,</span> <span class="n">len</span><span class="p">);</span>
+        <span class="n">ngx_sys_errlist</span><span class="p">[</span><span class="n">err</span><span class="p">].</span><span class="n">len</span> <span class="o">=</span> <span class="n">len</span><span class="p">;</span>
+        <span class="n">ngx_sys_errlist</span><span class="p">[</span><span class="n">err</span><span class="p">].</span><span class="n">data</span> <span class="o">=</span> <span class="n">p</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="k">return</span> <span class="n">NGX_OK</span><span class="p">;</span>
+
+<span class="nl">failed:</span>
+
+    <span class="n">err</span> <span class="o">=</span> <span class="n">errno</span><span class="p">;</span>
+    <span class="n">ngx_log_stderr</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="s">"malloc(%uz) failed (%d: %s)"</span><span class="p">,</span> <span class="n">len</span><span class="p">,</span> <span class="n">err</span><span class="p">,</span> <span class="n">strerror</span><span class="p">(</span><span class="n">err</span><span class="p">));</span>
+
+    <span class="k">return</span> <span class="n">NGX_ERROR</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre>
+</div>
+
+<p>而當調用ngx_strerror時，則把傳入的errno當作索引，直接從ngx_sys_errlist數組中獲取該錯誤字符串，並防止長度溢出地複製到傳入的字符串指針中。</p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/os/unix/ngx_errno.c 32~42
+</span>
+<span class="n">u_char</span> <span class="o">*</span>
+<span class="nf">ngx_strerror</span><span class="p">(</span><span class="n">ngx_err_t</span> <span class="n">err</span><span class="p">,</span> <span class="n">u_char</span> <span class="o">*</span><span class="n">errstr</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">size</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="n">ngx_str_t</span>  <span class="o">*</span><span class="n">msg</span><span class="p">;</span>
+
+    <span class="n">msg</span> <span class="o">=</span> <span class="p">((</span><span class="n">ngx_uint_t</span><span class="p">)</span> <span class="n">err</span> <span class="o">&lt;</span> <span class="n">NGX_SYS_NERR</span><span class="p">)</span> <span class="o">?</span> <span class="o">&amp;</span><span class="n">ngx_sys_errlist</span><span class="p">[</span><span class="n">err</span><span class="p">]</span><span class="o">:</span>
+                                              <span class="o">&amp;</span><span class="n">ngx_unknown_error</span><span class="p">;</span>
+    <span class="n">size</span> <span class="o">=</span> <span class="n">ngx_min</span><span class="p">(</span><span class="n">size</span><span class="p">,</span> <span class="n">msg</span><span class="o">-&gt;</span><span class="n">len</span><span class="p">);</span>
+
+    <span class="k">return</span> <span class="n">ngx_cpymem</span><span class="p">(</span><span class="n">errstr</span><span class="p">,</span> <span class="n">msg</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">,</span> <span class="n">size</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre>
+</div>
+
+<p>這樣做除了大大地簡化了調用strerror的流程，減少出錯機率，尤其是字符串複製函數strcpy使用錯誤的概率，而且還減少了庫函數的調用。</p>
+
+<p>##4. ngx_get_options()與命令行參數獲取</p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/core/nginx.c 203~215
+</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">ngx_get_options</span><span class="p">(</span><span class="n">argc</span><span class="p">,</span> <span class="n">argv</span><span class="p">)</span> <span class="o">!=</span> <span class="n">NGX_OK</span><span class="p">)</span> <span class="p">{</span>
+        <span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">ngx_show_version</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">ngx_show_version_info</span><span class="p">();</span>
+
+        <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ngx_test_config</span><span class="p">)</span> <span class="p">{</span>
+            <span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+        <span class="p">}</span>
+    <span class="p">}</span>
+
+    <span class="cm">/* TODO */</span> <span class="n">ngx_max_sockets</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+</code></pre>
+</div>
+
+<p>第202～212行，執行了ngx_get_options()。ngx_get_options函數和程序main函數的函數簽名相同，可見該函數就是直接接受main函數的參數為參數，是專門處理命令行參數的函數。</p>
+
+<p>該函數通過for循環迭代傳入的參數，若參數的第一個字符不為“-”，則不合法，返回錯誤；若合法，則用switch語句來執行對應的流程。如圖，部分的命令行參數會改變一些nginx的全局變量，而這些全局變量會在後續的運行中影響執行流程。</p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/os/unix/ngx_errno.c 727~852
+</span>
+<span class="k">static</span> <span class="n">ngx_int_t</span>
+<span class="nf">ngx_get_options</span><span class="p">(</span><span class="kt">int</span> <span class="n">argc</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="k">const</span> <span class="o">*</span><span class="n">argv</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="n">u_char</span>     <span class="o">*</span><span class="n">p</span><span class="p">;</span>
+    <span class="n">ngx_int_t</span>   <span class="n">i</span><span class="p">;</span>
+
+    <span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">argc</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+
+        <span class="n">p</span> <span class="o">=</span> <span class="p">(</span><span class="n">u_char</span> <span class="o">*</span><span class="p">)</span> <span class="n">argv</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+
+        <span class="k">if</span> <span class="p">(</span><span class="o">*</span><span class="n">p</span><span class="o">++</span> <span class="o">!=</span> <span class="sc">'-'</span><span class="p">)</span> <span class="p">{</span>
+            <span class="n">ngx_log_stderr</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="s">"invalid option: </span><span class="se">\"</span><span class="s">%s</span><span class="se">\"</span><span class="s">"</span><span class="p">,</span> <span class="n">argv</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+            <span class="k">return</span> <span class="n">NGX_ERROR</span><span class="p">;</span>
+        <span class="p">}</span>
+
+        <span class="k">while</span> <span class="p">(</span><span class="o">*</span><span class="n">p</span><span class="p">)</span> <span class="p">{</span>
+
+            <span class="k">switch</span> <span class="p">(</span><span class="o">*</span><span class="n">p</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+
+            <span class="k">case</span> <span class="sc">'?'</span><span class="p">:</span>
+            <span class="k">case</span> <span class="sc">'h'</span><span class="p">:</span>
+                <span class="n">ngx_show_version</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+                <span class="n">ngx_show_help</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+                <span class="k">break</span><span class="p">;</span>
+
+            <span class="k">case</span> <span class="sc">'v'</span><span class="p">:</span>
+                <span class="n">ngx_show_version</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+                <span class="k">break</span><span class="p">;</span>
+
+            <span class="k">case</span> <span class="sc">'V'</span><span class="p">:</span>
+                <span class="n">ngx_show_version</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+                <span class="n">ngx_show_configure</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+                <span class="k">break</span><span class="p">;</span>
+
+            <span class="k">case</span> <span class="sc">'t'</span><span class="p">:</span>
+                <span class="n">ngx_test_config</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+                <span class="k">break</span><span class="p">;</span>
+
+            <span class="k">case</span> <span class="sc">'T'</span><span class="p">:</span>
+                <span class="n">ngx_test_config</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+                <span class="n">ngx_dump_config</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+                <span class="k">break</span><span class="p">;</span>
+
+            <span class="k">case</span> <span class="sc">'q'</span><span class="p">:</span>
+                <span class="n">ngx_quiet_mode</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+                <span class="k">break</span><span class="p">;</span>
+
+            <span class="k">case</span> <span class="sc">'p'</span><span class="p">:</span>
+                <span class="k">if</span> <span class="p">(</span><span class="o">*</span><span class="n">p</span><span class="p">)</span> <span class="p">{</span>
+                    <span class="n">ngx_prefix</span> <span class="o">=</span> <span class="n">p</span><span class="p">;</span>
+                    <span class="k">goto</span> <span class="n">next</span><span class="p">;</span>
+                <span class="p">}</span>
+
+                <span class="k">if</span> <span class="p">(</span><span class="n">argv</span><span class="p">[</span><span class="o">++</span><span class="n">i</span><span class="p">])</span> <span class="p">{</span>
+                    <span class="n">ngx_prefix</span> <span class="o">=</span> <span class="p">(</span><span class="n">u_char</span> <span class="o">*</span><span class="p">)</span> <span class="n">argv</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+                    <span class="k">goto</span> <span class="n">next</span><span class="p">;</span>
+                <span class="p">}</span>
+
+                <span class="n">ngx_log_stderr</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="s">"option </span><span class="se">\"</span><span class="s">-p</span><span class="se">\"</span><span class="s"> requires directory name"</span><span class="p">);</span>
+                <span class="k">return</span> <span class="n">NGX_ERROR</span><span class="p">;</span>
+
+            <span class="k">case</span> <span class="sc">'c'</span><span class="p">:</span>
+                <span class="k">if</span> <span class="p">(</span><span class="o">*</span><span class="n">p</span><span class="p">)</span> <span class="p">{</span>
+                    <span class="n">ngx_conf_file</span> <span class="o">=</span> <span class="n">p</span><span class="p">;</span>
+                    <span class="k">goto</span> <span class="n">next</span><span class="p">;</span>
+                <span class="p">}</span>
+
+                <span class="k">if</span> <span class="p">(</span><span class="n">argv</span><span class="p">[</span><span class="o">++</span><span class="n">i</span><span class="p">])</span> <span class="p">{</span>
+                    <span class="n">ngx_conf_file</span> <span class="o">=</span> <span class="p">(</span><span class="n">u_char</span> <span class="o">*</span><span class="p">)</span> <span class="n">argv</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+                    <span class="k">goto</span> <span class="n">next</span><span class="p">;</span>
+                <span class="p">}</span>
+
+                <span class="n">ngx_log_stderr</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="s">"option </span><span class="se">\"</span><span class="s">-c</span><span class="se">\"</span><span class="s"> requires file name"</span><span class="p">);</span>
+                <span class="k">return</span> <span class="n">NGX_ERROR</span><span class="p">;</span>
+
+            <span class="k">case</span> <span class="sc">'g'</span><span class="p">:</span>
+                <span class="k">if</span> <span class="p">(</span><span class="o">*</span><span class="n">p</span><span class="p">)</span> <span class="p">{</span>
+                    <span class="n">ngx_conf_params</span> <span class="o">=</span> <span class="n">p</span><span class="p">;</span>
+                    <span class="k">goto</span> <span class="n">next</span><span class="p">;</span>
+                <span class="p">}</span>
+
+                <span class="k">if</span> <span class="p">(</span><span class="n">argv</span><span class="p">[</span><span class="o">++</span><span class="n">i</span><span class="p">])</span> <span class="p">{</span>
+                    <span class="n">ngx_conf_params</span> <span class="o">=</span> <span class="p">(</span><span class="n">u_char</span> <span class="o">*</span><span class="p">)</span> <span class="n">argv</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+                    <span class="k">goto</span> <span class="n">next</span><span class="p">;</span>
+                <span class="p">}</span>
+
+                <span class="n">ngx_log_stderr</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="s">"option </span><span class="se">\"</span><span class="s">-g</span><span class="se">\"</span><span class="s"> requires parameter"</span><span class="p">);</span>
+                <span class="k">return</span> <span class="n">NGX_ERROR</span><span class="p">;</span>
+
+            <span class="k">case</span> <span class="sc">'s'</span><span class="p">:</span>
+                <span class="k">if</span> <span class="p">(</span><span class="o">*</span><span class="n">p</span><span class="p">)</span> <span class="p">{</span>
+                    <span class="n">ngx_signal</span> <span class="o">=</span> <span class="p">(</span><span class="kt">char</span> <span class="o">*</span><span class="p">)</span> <span class="n">p</span><span class="p">;</span>
+
+                <span class="p">}</span> <span class="k">else</span> <span class="k">if</span> <span class="p">(</span><span class="n">argv</span><span class="p">[</span><span class="o">++</span><span class="n">i</span><span class="p">])</span> <span class="p">{</span>
+                    <span class="n">ngx_signal</span> <span class="o">=</span> <span class="n">argv</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+
+                <span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+                    <span class="n">ngx_log_stderr</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="s">"option </span><span class="se">\"</span><span class="s">-s</span><span class="se">\"</span><span class="s"> requires parameter"</span><span class="p">);</span>
+                    <span class="k">return</span> <span class="n">NGX_ERROR</span><span class="p">;</span>
+                <span class="p">}</span>
+
+                <span class="k">if</span> <span class="p">(</span><span class="n">ngx_strcmp</span><span class="p">(</span><span class="n">ngx_signal</span><span class="p">,</span> <span class="s">"stop"</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span>
+                    <span class="o">||</span> <span class="n">ngx_strcmp</span><span class="p">(</span><span class="n">ngx_signal</span><span class="p">,</span> <span class="s">"quit"</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span>
+                    <span class="o">||</span> <span class="n">ngx_strcmp</span><span class="p">(</span><span class="n">ngx_signal</span><span class="p">,</span> <span class="s">"reopen"</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span>
+                    <span class="o">||</span> <span class="n">ngx_strcmp</span><span class="p">(</span><span class="n">ngx_signal</span><span class="p">,</span> <span class="s">"reload"</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span>
+                <span class="p">{</span>
+                    <span class="n">ngx_process</span> <span class="o">=</span> <span class="n">NGX_PROCESS_SIGNALLER</span><span class="p">;</span>
+                    <span class="k">goto</span> <span class="n">next</span><span class="p">;</span>
+                <span class="p">}</span>
+
+                <span class="n">ngx_log_stderr</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="s">"invalid option: </span><span class="se">\"</span><span class="s">-s %s</span><span class="se">\"</span><span class="s">"</span><span class="p">,</span> <span class="n">ngx_signal</span><span class="p">);</span>
+                <span class="k">return</span> <span class="n">NGX_ERROR</span><span class="p">;</span>
+
+            <span class="nl">default:</span>
+                <span class="n">ngx_log_stderr</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="s">"invalid option: </span><span class="se">\"</span><span class="s">%c</span><span class="se">\"</span><span class="s">"</span><span class="p">,</span> <span class="o">*</span><span class="p">(</span><span class="n">p</span> <span class="o">-</span> <span class="mi">1</span><span class="p">));</span>
+                <span class="k">return</span> <span class="n">NGX_ERROR</span><span class="p">;</span>
+            <span class="p">}</span>
+        <span class="p">}</span>
+
+    <span class="nl">next:</span>
+
+        <span class="k">continue</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="k">return</span> <span class="n">NGX_OK</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre>
+</div>
+
+<p>這裡有一個很巧妙的處理。因為nginx的命令除了以“-”開頭之外，還有可能是沒有“-”開頭的參數，但根據每次for循環開始時的判斷，命令的參數會被視為錯誤的指令，然而nginx在可以帶參數的命令做了一個小處理，當命令時需要帶參數的時候，把for循環迭代的指針遞增，把參數讀取到相關的地方，然後跳到下一個循環，而這是for循環就會迭代下一個指令，而不是當前指令的參數。
+獲取了nginx的命令後，即刻檢查當前是否僅僅為顯示版本的模式，如果是，則直接顯示nginx版本信息然後退出程序。</p>
+
+<p>##5. ngx_time_init()與nginx時間處理</p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/core/nginx.c 217
+</span>
+    <span class="n">ngx_time_init</span><span class="p">();</span>
+</code></pre>
+</div>
+
+<p>第217行，調用src/core/ngx_times.h下的ngx_time_init()函數，對nginx的時間相關實現進行了初始化。nginx內置了五種時間格式，因此全局聲明了如圖五個ngx_str_t變量。ngx_time_init()函數，為這些ngx_str_t類型賦值了其長度，而在最後調用ngx_time_update()函數，該函數把當前的時間的字符串指賦值到這五個ngx_str_t時間變量中。</p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/core/ngx_times.h 39~43
+</span>
+<span class="k">extern</span> <span class="k">volatile</span> <span class="n">ngx_str_t</span>    <span class="n">ngx_cached_err_log_time</span><span class="p">;</span>
+<span class="k">extern</span> <span class="k">volatile</span> <span class="n">ngx_str_t</span>    <span class="n">ngx_cached_http_time</span><span class="p">;</span>
+<span class="k">extern</span> <span class="k">volatile</span> <span class="n">ngx_str_t</span>    <span class="n">ngx_cached_http_log_time</span><span class="p">;</span>
+<span class="k">extern</span> <span class="k">volatile</span> <span class="n">ngx_str_t</span>    <span class="n">ngx_cached_http_log_iso8601</span><span class="p">;</span>
+<span class="k">extern</span> <span class="k">volatile</span> <span class="n">ngx_str_t</span>    <span class="n">ngx_cached_syslog_time</span><span class="p">;</span>
+</code></pre>
+</div>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/core/ngx_times.c 62~74
+</span>
+<span class="kt">void</span>
+<span class="nf">ngx_time_init</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="n">ngx_cached_err_log_time</span><span class="p">.</span><span class="n">len</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="s">"1970/09/28 12:00:00"</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">;</span>
+    <span class="n">ngx_cached_http_time</span><span class="p">.</span><span class="n">len</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="s">"Mon, 28 Sep 1970 06:00:00 GMT"</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">;</span>
+    <span class="n">ngx_cached_http_log_time</span><span class="p">.</span><span class="n">len</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="s">"28/Sep/1970:12:00:00 +0600"</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">;</span>
+    <span class="n">ngx_cached_http_log_iso8601</span><span class="p">.</span><span class="n">len</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="s">"1970-09-28T12:00:00+06:00"</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">;</span>
+    <span class="n">ngx_cached_syslog_time</span><span class="p">.</span><span class="n">len</span> <span class="o">=</span> <span class="k">sizeof</span><span class="p">(</span><span class="s">"Sep 28 12:00:00"</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">;</span>
+
+    <span class="n">ngx_cached_time</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">cached_time</span><span class="p">[</span><span class="mi">0</span><span class="p">];</span>
+
+    <span class="n">ngx_time_update</span><span class="p">();</span>
+<span class="p">}</span>
+</code></pre>
+</div>
+
+<p>nginx使用事件驅動或者多線程來更新當前時間，而每次時間的更新都會調用ngx_time_update()函數，該函數會用ngx_gettimeofday（即gettimeofday系統函數）來獲取當前的時間，然後通過格式化字符串複製，把當前時間的字符串按照格式地複製到這個nginx表達時間的全局ngx_str_t變量中。</p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/core/ngx_times.c 77~189
+</span>
+<span class="kt">void</span>
+<span class="nf">ngx_time_update</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="n">u_char</span>          <span class="o">*</span><span class="n">p0</span><span class="p">,</span> <span class="o">*</span><span class="n">p1</span><span class="p">,</span> <span class="o">*</span><span class="n">p2</span><span class="p">,</span> <span class="o">*</span><span class="n">p3</span><span class="p">,</span> <span class="o">*</span><span class="n">p4</span><span class="p">;</span>
+    <span class="n">ngx_tm_t</span>         <span class="n">tm</span><span class="p">,</span> <span class="n">gmt</span><span class="p">;</span>
+    <span class="kt">time_t</span>           <span class="n">sec</span><span class="p">;</span>
+    <span class="n">ngx_uint_t</span>       <span class="n">msec</span><span class="p">;</span>
+    <span class="n">ngx_time_t</span>      <span class="o">*</span><span class="n">tp</span><span class="p">;</span>
+    <span class="k">struct</span> <span class="n">timeval</span>   <span class="n">tv</span><span class="p">;</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ngx_trylock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ngx_time_lock</span><span class="p">))</span> <span class="p">{</span>
+        <span class="k">return</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="n">ngx_gettimeofday</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tv</span><span class="p">);</span>
+
+    <span class="n">sec</span> <span class="o">=</span> <span class="n">tv</span><span class="p">.</span><span class="n">tv_sec</span><span class="p">;</span>
+    <span class="n">msec</span> <span class="o">=</span> <span class="n">tv</span><span class="p">.</span><span class="n">tv_usec</span> <span class="o">/</span> <span class="mi">1000</span><span class="p">;</span>
+
+    <span class="n">ngx_current_msec</span> <span class="o">=</span> <span class="p">(</span><span class="n">ngx_msec_t</span><span class="p">)</span> <span class="n">sec</span> <span class="o">*</span> <span class="mi">1000</span> <span class="o">+</span> <span class="n">msec</span><span class="p">;</span>
+
+    <span class="n">tp</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">cached_time</span><span class="p">[</span><span class="n">slot</span><span class="p">];</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">tp</span><span class="o">-&gt;</span><span class="n">sec</span> <span class="o">==</span> <span class="n">sec</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">tp</span><span class="o">-&gt;</span><span class="n">msec</span> <span class="o">=</span> <span class="n">msec</span><span class="p">;</span>
+        <span class="n">ngx_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ngx_time_lock</span><span class="p">);</span>
+        <span class="k">return</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">slot</span> <span class="o">==</span> <span class="n">NGX_TIME_SLOTS</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">slot</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+    <span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+        <span class="n">slot</span><span class="o">++</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="n">tp</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">cached_time</span><span class="p">[</span><span class="n">slot</span><span class="p">];</span>
+
+    <span class="n">tp</span><span class="o">-&gt;</span><span class="n">sec</span> <span class="o">=</span> <span class="n">sec</span><span class="p">;</span>
+    <span class="n">tp</span><span class="o">-&gt;</span><span class="n">msec</span> <span class="o">=</span> <span class="n">msec</span><span class="p">;</span>
+
+    <span class="n">ngx_gmtime</span><span class="p">(</span><span class="n">sec</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">gmt</span><span class="p">);</span>
+
+
+    <span class="n">p0</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">cached_http_time</span><span class="p">[</span><span class="n">slot</span><span class="p">][</span><span class="mi">0</span><span class="p">];</span>
+
+    <span class="p">(</span><span class="kt">void</span><span class="p">)</span> <span class="n">ngx_sprintf</span><span class="p">(</span><span class="n">p0</span><span class="p">,</span> <span class="s">"%s, %02d %s %4d %02d:%02d:%02d GMT"</span><span class="p">,</span>
+                       <span class="n">week</span><span class="p">[</span><span class="n">gmt</span><span class="p">.</span><span class="n">ngx_tm_wday</span><span class="p">],</span> <span class="n">gmt</span><span class="p">.</span><span class="n">ngx_tm_mday</span><span class="p">,</span>
+                       <span class="n">months</span><span class="p">[</span><span class="n">gmt</span><span class="p">.</span><span class="n">ngx_tm_mon</span> <span class="o">-</span> <span class="mi">1</span><span class="p">],</span> <span class="n">gmt</span><span class="p">.</span><span class="n">ngx_tm_year</span><span class="p">,</span>
+                       <span class="n">gmt</span><span class="p">.</span><span class="n">ngx_tm_hour</span><span class="p">,</span> <span class="n">gmt</span><span class="p">.</span><span class="n">ngx_tm_min</span><span class="p">,</span> <span class="n">gmt</span><span class="p">.</span><span class="n">ngx_tm_sec</span><span class="p">);</span>
+
+<span class="cp">#if (NGX_HAVE_GETTIMEZONE)
+</span>
+    <span class="n">tp</span><span class="o">-&gt;</span><span class="n">gmtoff</span> <span class="o">=</span> <span class="n">ngx_gettimezone</span><span class="p">();</span>
+    <span class="n">ngx_gmtime</span><span class="p">(</span><span class="n">sec</span> <span class="o">+</span> <span class="n">tp</span><span class="o">-&gt;</span><span class="n">gmtoff</span> <span class="o">*</span> <span class="mi">60</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tm</span><span class="p">);</span>
+
+<span class="cp">#elif (NGX_HAVE_GMTOFF)
+</span>
+    <span class="n">ngx_localtime</span><span class="p">(</span><span class="n">sec</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tm</span><span class="p">);</span>
+    <span class="n">cached_gmtoff</span> <span class="o">=</span> <span class="p">(</span><span class="n">ngx_int_t</span><span class="p">)</span> <span class="p">(</span><span class="n">tm</span><span class="p">.</span><span class="n">ngx_tm_gmtoff</span> <span class="o">/</span> <span class="mi">60</span><span class="p">);</span>
+    <span class="n">tp</span><span class="o">-&gt;</span><span class="n">gmtoff</span> <span class="o">=</span> <span class="n">cached_gmtoff</span><span class="p">;</span>
+
+<span class="cp">#else
+</span>
+    <span class="n">ngx_localtime</span><span class="p">(</span><span class="n">sec</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">tm</span><span class="p">);</span>
+    <span class="n">cached_gmtoff</span> <span class="o">=</span> <span class="n">ngx_timezone</span><span class="p">(</span><span class="n">tm</span><span class="p">.</span><span class="n">ngx_tm_isdst</span><span class="p">);</span>
+    <span class="n">tp</span><span class="o">-&gt;</span><span class="n">gmtoff</span> <span class="o">=</span> <span class="n">cached_gmtoff</span><span class="p">;</span>
+
+<span class="cp">#endif
+</span>
+
+    <span class="n">p1</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">cached_err_log_time</span><span class="p">[</span><span class="n">slot</span><span class="p">][</span><span class="mi">0</span><span class="p">];</span>
+
+    <span class="p">(</span><span class="kt">void</span><span class="p">)</span> <span class="n">ngx_sprintf</span><span class="p">(</span><span class="n">p1</span><span class="p">,</span> <span class="s">"%4d/%02d/%02d %02d:%02d:%02d"</span><span class="p">,</span>
+                       <span class="n">tm</span><span class="p">.</span><span class="n">ngx_tm_year</span><span class="p">,</span> <span class="n">tm</span><span class="p">.</span><span class="n">ngx_tm_mon</span><span class="p">,</span>
+                       <span class="n">tm</span><span class="p">.</span><span class="n">ngx_tm_mday</span><span class="p">,</span> <span class="n">tm</span><span class="p">.</span><span class="n">ngx_tm_hour</span><span class="p">,</span>
+                       <span class="n">tm</span><span class="p">.</span><span class="n">ngx_tm_min</span><span class="p">,</span> <span class="n">tm</span><span class="p">.</span><span class="n">ngx_tm_sec</span><span class="p">);</span>
+
+
+    <span class="n">p2</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">cached_http_log_time</span><span class="p">[</span><span class="n">slot</span><span class="p">][</span><span class="mi">0</span><span class="p">];</span>
+
+    <span class="p">(</span><span class="kt">void</span><span class="p">)</span> <span class="n">ngx_sprintf</span><span class="p">(</span><span class="n">p2</span><span class="p">,</span> <span class="s">"%02d/%s/%d:%02d:%02d:%02d %c%02i%02i"</span><span class="p">,</span>
+                       <span class="n">tm</span><span class="p">.</span><span class="n">ngx_tm_mday</span><span class="p">,</span> <span class="n">months</span><span class="p">[</span><span class="n">tm</span><span class="p">.</span><span class="n">ngx_tm_mon</span> <span class="o">-</span> <span class="mi">1</span><span class="p">],</span>
+                       <span class="n">tm</span><span class="p">.</span><span class="n">ngx_tm_year</span><span class="p">,</span> <span class="n">tm</span><span class="p">.</span><span class="n">ngx_tm_hour</span><span class="p">,</span>
+                       <span class="n">tm</span><span class="p">.</span><span class="n">ngx_tm_min</span><span class="p">,</span> <span class="n">tm</span><span class="p">.</span><span class="n">ngx_tm_sec</span><span class="p">,</span>
+                       <span class="n">tp</span><span class="o">-&gt;</span><span class="n">gmtoff</span> <span class="o">&lt;</span> <span class="mi">0</span> <span class="o">?</span> <span class="sc">'-'</span> <span class="o">:</span> <span class="sc">'+'</span><span class="p">,</span>
+                       <span class="n">ngx_abs</span><span class="p">(</span><span class="n">tp</span><span class="o">-&gt;</span><span class="n">gmtoff</span> <span class="o">/</span> <span class="mi">60</span><span class="p">),</span> <span class="n">ngx_abs</span><span class="p">(</span><span class="n">tp</span><span class="o">-&gt;</span><span class="n">gmtoff</span> <span class="o">%</span> <span class="mi">60</span><span class="p">));</span>
+
+    <span class="n">p3</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">cached_http_log_iso8601</span><span class="p">[</span><span class="n">slot</span><span class="p">][</span><span class="mi">0</span><span class="p">];</span>
+
+    <span class="p">(</span><span class="kt">void</span><span class="p">)</span> <span class="n">ngx_sprintf</span><span class="p">(</span><span class="n">p3</span><span class="p">,</span> <span class="s">"%4d-%02d-%02dT%02d:%02d:%02d%c%02i:%02i"</span><span class="p">,</span>
+                       <span class="n">tm</span><span class="p">.</span><span class="n">ngx_tm_year</span><span class="p">,</span> <span class="n">tm</span><span class="p">.</span><span class="n">ngx_tm_mon</span><span class="p">,</span>
+                       <span class="n">tm</span><span class="p">.</span><span class="n">ngx_tm_mday</span><span class="p">,</span> <span class="n">tm</span><span class="p">.</span><span class="n">ngx_tm_hour</span><span class="p">,</span>
+                       <span class="n">tm</span><span class="p">.</span><span class="n">ngx_tm_min</span><span class="p">,</span> <span class="n">tm</span><span class="p">.</span><span class="n">ngx_tm_sec</span><span class="p">,</span>
+                       <span class="n">tp</span><span class="o">-&gt;</span><span class="n">gmtoff</span> <span class="o">&lt;</span> <span class="mi">0</span> <span class="o">?</span> <span class="sc">'-'</span> <span class="o">:</span> <span class="sc">'+'</span><span class="p">,</span>
+                       <span class="n">ngx_abs</span><span class="p">(</span><span class="n">tp</span><span class="o">-&gt;</span><span class="n">gmtoff</span> <span class="o">/</span> <span class="mi">60</span><span class="p">),</span> <span class="n">ngx_abs</span><span class="p">(</span><span class="n">tp</span><span class="o">-&gt;</span><span class="n">gmtoff</span> <span class="o">%</span> <span class="mi">60</span><span class="p">));</span>
+
+    <span class="n">p4</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">cached_syslog_time</span><span class="p">[</span><span class="n">slot</span><span class="p">][</span><span class="mi">0</span><span class="p">];</span>
+
+    <span class="p">(</span><span class="kt">void</span><span class="p">)</span> <span class="n">ngx_sprintf</span><span class="p">(</span><span class="n">p4</span><span class="p">,</span> <span class="s">"%s %2d %02d:%02d:%02d"</span><span class="p">,</span>
+                       <span class="n">months</span><span class="p">[</span><span class="n">tm</span><span class="p">.</span><span class="n">ngx_tm_mon</span> <span class="o">-</span> <span class="mi">1</span><span class="p">],</span> <span class="n">tm</span><span class="p">.</span><span class="n">ngx_tm_mday</span><span class="p">,</span>
+                       <span class="n">tm</span><span class="p">.</span><span class="n">ngx_tm_hour</span><span class="p">,</span> <span class="n">tm</span><span class="p">.</span><span class="n">ngx_tm_min</span><span class="p">,</span> <span class="n">tm</span><span class="p">.</span><span class="n">ngx_tm_sec</span><span class="p">);</span>
+
+    <span class="n">ngx_memory_barrier</span><span class="p">();</span>
+
+    <span class="n">ngx_cached_time</span> <span class="o">=</span> <span class="n">tp</span><span class="p">;</span>
+    <span class="n">ngx_cached_http_time</span><span class="p">.</span><span class="n">data</span> <span class="o">=</span> <span class="n">p0</span><span class="p">;</span>
+    <span class="n">ngx_cached_err_log_time</span><span class="p">.</span><span class="n">data</span> <span class="o">=</span> <span class="n">p1</span><span class="p">;</span>
+    <span class="n">ngx_cached_http_log_time</span><span class="p">.</span><span class="n">data</span> <span class="o">=</span> <span class="n">p2</span><span class="p">;</span>
+    <span class="n">ngx_cached_http_log_iso8601</span><span class="p">.</span><span class="n">data</span> <span class="o">=</span> <span class="n">p3</span><span class="p">;</span>
+    <span class="n">ngx_cached_syslog_time</span><span class="p">.</span><span class="n">data</span> <span class="o">=</span> <span class="n">p4</span><span class="p">;</span>
+
+    <span class="n">ngx_unlock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ngx_time_lock</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre>
+</div>
+
+<p>因為幾種時間格式需要顯示當前時區的時間，因此nginx會根據不同的時區配置來計算時間，而時間的格式化則通過ngx_sprintf函數（即sprintf庫函數）實現格式化。</p>
+
+<p>順帶一提，nginx認為固定的開銷比隨著用戶數量增長而增長的開銷要來的實際，就如獲取時間，定期把時間更新到字符串，然後直接從字符串複製當前時間，比每次用戶需要獲取時間再從系統獲取時間要好。即使每毫秒更新一次時間，獲取系統時間的頻率也只不過一秒一千次，而如果有一千個用戶同時在一秒內獲取數次時間，這個頻率已經遠超一千次。而當系統面臨壓力的時候，這種調用對系統性能的影響簡直就是呈正反饋趨勢，很容易就會把系統壓垮。</p>
+
+<p>##6. getpid和ngx_log_init()</p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/core/nginx.c 223~228
+</span>
+    <span class="n">ngx_pid</span> <span class="o">=</span> <span class="n">ngx_getpid</span><span class="p">();</span>
+
+    <span class="n">log</span> <span class="o">=</span> <span class="n">ngx_log_init</span><span class="p">(</span><span class="n">ngx_prefix</span><span class="p">);</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">log</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+        <span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+    <span class="p">}</span>
+</code></pre>
+</div>
+
+<p>第223行，調用ngx_getpid()函數，獲取當前進程的ID。其實這是一個位於os/unix/ngx_proccess.h的宏定義，在預處理時將會被替代成unistd.h庫下的getpid函數。</p>
+
+<p>第225～228行，對ngx_log模塊進行初始化。傳入的ngx_prefix為字符指針，指的是nginx當前配置的目錄前綴，但當nginx初次啟動時其指針值為NULL。</p>
+
+<p>ngx_log_init()主要是對ngx_log.c中定義的ngx_log和ngx_log_file變量進行初始化，並返回ngx_log的指針。ngx_log_file變量為ngx_open_file_t類型，亦即是存儲當前打開的文件信息的結構體，在這裡，ngx_log_file的指針當即賦值給ngx_log的file變量中。若NGX_ERROR_LOG_PATH未定義，則無法使用error_log，因此直接把ngx_log_file的fd賦值為ngx_stderr標準錯誤輸出流，直接返回當前的ngx_log指針。而後把函數參數prefix和NGX_ERROR_LOG_PATH連結成錯誤日誌文件路徑，若傳入的prefix為NULL，則使用nginx默認的NGX_PREFIX路徑，然後創建或者打開該錯誤日誌文件，若沒有錯誤，把fd賦值到ngx_log_file中，然後返回ngx_log指針。</p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/core/ngx_log.c 317~400
+</span>
+<span class="n">ngx_log_t</span> <span class="o">*</span>
+<span class="nf">ngx_log_init</span><span class="p">(</span><span class="n">u_char</span> <span class="o">*</span><span class="n">prefix</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="n">u_char</span>  <span class="o">*</span><span class="n">p</span><span class="p">,</span> <span class="o">*</span><span class="n">name</span><span class="p">;</span>
+    <span class="kt">size_t</span>   <span class="n">nlen</span><span class="p">,</span> <span class="n">plen</span><span class="p">;</span>
+
+    <span class="n">ngx_log</span><span class="p">.</span><span class="n">file</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">ngx_log_file</span><span class="p">;</span>
+    <span class="n">ngx_log</span><span class="p">.</span><span class="n">log_level</span> <span class="o">=</span> <span class="n">NGX_LOG_NOTICE</span><span class="p">;</span>
+
+    <span class="n">name</span> <span class="o">=</span> <span class="p">(</span><span class="n">u_char</span> <span class="o">*</span><span class="p">)</span> <span class="n">NGX_ERROR_LOG_PATH</span><span class="p">;</span>
+
+    <span class="cm">/*
+     * we use ngx_strlen() here since BCC warns about
+     * condition is always false and unreachable code
+     */</span>
+
+    <span class="n">nlen</span> <span class="o">=</span> <span class="n">ngx_strlen</span><span class="p">(</span><span class="n">name</span><span class="p">);</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">nlen</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">ngx_log_file</span><span class="p">.</span><span class="n">fd</span> <span class="o">=</span> <span class="n">ngx_stderr</span><span class="p">;</span>
+        <span class="k">return</span> <span class="o">&amp;</span><span class="n">ngx_log</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="n">p</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+<span class="cp">#if (NGX_WIN32)
+</span>    <span class="k">if</span> <span class="p">(</span><span class="n">name</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">!=</span> <span class="sc">':'</span><span class="p">)</span> <span class="p">{</span>
+<span class="cp">#else
+</span>    <span class="k">if</span> <span class="p">(</span><span class="n">name</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">!=</span> <span class="sc">'/'</span><span class="p">)</span> <span class="p">{</span>
+<span class="cp">#endif
+</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">prefix</span><span class="p">)</span> <span class="p">{</span>
+            <span class="n">plen</span> <span class="o">=</span> <span class="n">ngx_strlen</span><span class="p">(</span><span class="n">prefix</span><span class="p">);</span>
+
+        <span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+<span class="cp">#ifdef NGX_PREFIX
+</span>            <span class="n">prefix</span> <span class="o">=</span> <span class="p">(</span><span class="n">u_char</span> <span class="o">*</span><span class="p">)</span> <span class="n">NGX_PREFIX</span><span class="p">;</span>
+            <span class="n">plen</span> <span class="o">=</span> <span class="n">ngx_strlen</span><span class="p">(</span><span class="n">prefix</span><span class="p">);</span>
+<span class="cp">#else
+</span>            <span class="n">plen</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+<span class="cp">#endif
+</span>        <span class="p">}</span>
+
+        <span class="k">if</span> <span class="p">(</span><span class="n">plen</span><span class="p">)</span> <span class="p">{</span>
+            <span class="n">name</span> <span class="o">=</span> <span class="n">malloc</span><span class="p">(</span><span class="n">plen</span> <span class="o">+</span> <span class="n">nlen</span> <span class="o">+</span> <span class="mi">2</span><span class="p">);</span>
+            <span class="k">if</span> <span class="p">(</span><span class="n">name</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+                <span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+            <span class="p">}</span>
+
+            <span class="n">p</span> <span class="o">=</span> <span class="n">ngx_cpymem</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">prefix</span><span class="p">,</span> <span class="n">plen</span><span class="p">);</span>
+
+            <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ngx_path_separator</span><span class="p">(</span><span class="o">*</span><span class="p">(</span><span class="n">p</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)))</span> <span class="p">{</span>
+                <span class="o">*</span><span class="n">p</span><span class="o">++</span> <span class="o">=</span> <span class="sc">'/'</span><span class="p">;</span>
+            <span class="p">}</span>
+
+            <span class="n">ngx_cpystrn</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="p">(</span><span class="n">u_char</span> <span class="o">*</span><span class="p">)</span> <span class="n">NGX_ERROR_LOG_PATH</span><span class="p">,</span> <span class="n">nlen</span> <span class="o">+</span> <span class="mi">1</span><span class="p">);</span>
+
+            <span class="n">p</span> <span class="o">=</span> <span class="n">name</span><span class="p">;</span>
+        <span class="p">}</span>
+    <span class="p">}</span>
+
+    <span class="n">ngx_log_file</span><span class="p">.</span><span class="n">fd</span> <span class="o">=</span> <span class="n">ngx_open_file</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">NGX_FILE_APPEND</span><span class="p">,</span>
+                                    <span class="n">NGX_FILE_CREATE_OR_OPEN</span><span class="p">,</span>
+                                    <span class="n">NGX_FILE_DEFAULT_ACCESS</span><span class="p">);</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">ngx_log_file</span><span class="p">.</span><span class="n">fd</span> <span class="o">==</span> <span class="n">NGX_INVALID_FILE</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">ngx_log_stderr</span><span class="p">(</span><span class="n">ngx_errno</span><span class="p">,</span>
+                       <span class="s">"[alert] could not open error log file: "</span>
+                       <span class="n">ngx_open_file_n</span> <span class="s">" </span><span class="se">\"</span><span class="s">%s</span><span class="se">\"</span><span class="s"> failed"</span><span class="p">,</span> <span class="n">name</span><span class="p">);</span>
+<span class="cp">#if (NGX_WIN32)
+</span>        <span class="n">ngx_event_log</span><span class="p">(</span><span class="n">ngx_errno</span><span class="p">,</span>
+                       <span class="s">"could not open error log file: "</span>
+                       <span class="n">ngx_open_file_n</span> <span class="s">" </span><span class="se">\"</span><span class="s">%s</span><span class="se">\"</span><span class="s"> failed"</span><span class="p">,</span> <span class="n">name</span><span class="p">);</span>
+<span class="cp">#endif
+</span>
+        <span class="n">ngx_log_file</span><span class="p">.</span><span class="n">fd</span> <span class="o">=</span> <span class="n">ngx_stderr</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">p</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">ngx_free</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+    <span class="p">}</span>
+
+    <span class="k">return</span> <span class="o">&amp;</span><span class="n">ngx_log</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre>
+</div>
+
+<p>##7. init_cycle的初始化</p>
+
+<p>第235～255行，對init_cycle變量進行初步的初始化。
+init_cycle變量在函數棧空間上，對其內存空間進行清零操作，然後把上文獲得的日誌log指針和新創建的內存池pool指針賦值給init_cycle的變量。</p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/core/nginx.c 235~255
+</span>
+    <span class="cm">/*
+     * init_cycle-&gt;log is required for signal handlers and
+     * ngx_process_options()
+     */</span>
+
+    <span class="n">ngx_memzero</span><span class="p">(</span><span class="o">&amp;</span><span class="n">init_cycle</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">ngx_cycle_t</span><span class="p">));</span>
+    <span class="n">init_cycle</span><span class="p">.</span><span class="n">log</span> <span class="o">=</span> <span class="n">log</span><span class="p">;</span>
+    <span class="n">ngx_cycle</span> <span class="o">=</span> <span class="o">&amp;</span><span class="n">init_cycle</span><span class="p">;</span>
+
+    <span class="n">init_cycle</span><span class="p">.</span><span class="n">pool</span> <span class="o">=</span> <span class="n">ngx_create_pool</span><span class="p">(</span><span class="mi">1024</span><span class="p">,</span> <span class="n">log</span><span class="p">);</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">init_cycle</span><span class="p">.</span><span class="n">pool</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+        <span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">ngx_save_argv</span><span class="p">(</span><span class="o">&amp;</span><span class="n">init_cycle</span><span class="p">,</span> <span class="n">argc</span><span class="p">,</span> <span class="n">argv</span><span class="p">)</span> <span class="o">!=</span> <span class="n">NGX_OK</span><span class="p">)</span> <span class="p">{</span>
+        <span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">ngx_process_options</span><span class="p">(</span><span class="o">&amp;</span><span class="n">init_cycle</span><span class="p">)</span> <span class="o">!=</span> <span class="n">NGX_OK</span><span class="p">)</span> <span class="p">{</span>
+        <span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+    <span class="p">}</span>
+</code></pre>
+</div>
+
+<p>ngx_save_argv()函數，用於保存main函數傳入的參數。有趣的是，nginx通過條件編譯的方法，區分開FreeBSD和其它平台的實現，FreeBSD僅需直接把參數的指針賦值到變量即可，而其它平台則需要創建堆空間來存放參數變量，這到底是為什麼呢？嗯，有待思考。</p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/core/nginx.c 855~894
+</span>
+<span class="k">static</span> <span class="n">ngx_int_t</span>
+<span class="nf">ngx_save_argv</span><span class="p">(</span><span class="n">ngx_cycle_t</span> <span class="o">*</span><span class="n">cycle</span><span class="p">,</span> <span class="kt">int</span> <span class="n">argc</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="k">const</span> <span class="o">*</span><span class="n">argv</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="cp">#if (NGX_FREEBSD)
+</span>
+    <span class="n">ngx_os_argv</span> <span class="o">=</span> <span class="p">(</span><span class="kt">char</span> <span class="o">**</span><span class="p">)</span> <span class="n">argv</span><span class="p">;</span>
+    <span class="n">ngx_argc</span> <span class="o">=</span> <span class="n">argc</span><span class="p">;</span>
+    <span class="n">ngx_argv</span> <span class="o">=</span> <span class="p">(</span><span class="kt">char</span> <span class="o">**</span><span class="p">)</span> <span class="n">argv</span><span class="p">;</span>
+
+<span class="cp">#else
+</span>    <span class="kt">size_t</span>     <span class="n">len</span><span class="p">;</span>
+    <span class="n">ngx_int_t</span>  <span class="n">i</span><span class="p">;</span>
+
+    <span class="n">ngx_os_argv</span> <span class="o">=</span> <span class="p">(</span><span class="kt">char</span> <span class="o">**</span><span class="p">)</span> <span class="n">argv</span><span class="p">;</span>
+    <span class="n">ngx_argc</span> <span class="o">=</span> <span class="n">argc</span><span class="p">;</span>
+
+    <span class="n">ngx_argv</span> <span class="o">=</span> <span class="n">ngx_alloc</span><span class="p">((</span><span class="n">argc</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="k">sizeof</span><span class="p">(</span><span class="kt">char</span> <span class="o">*</span><span class="p">),</span> <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">);</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">ngx_argv</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+        <span class="k">return</span> <span class="n">NGX_ERROR</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">argc</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">len</span> <span class="o">=</span> <span class="n">ngx_strlen</span><span class="p">(</span><span class="n">argv</span><span class="p">[</span><span class="n">i</span><span class="p">])</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span>
+
+        <span class="n">ngx_argv</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">ngx_alloc</span><span class="p">(</span><span class="n">len</span><span class="p">,</span> <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">);</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">ngx_argv</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+            <span class="k">return</span> <span class="n">NGX_ERROR</span><span class="p">;</span>
+        <span class="p">}</span>
+
+        <span class="p">(</span><span class="kt">void</span><span class="p">)</span> <span class="n">ngx_cpystrn</span><span class="p">((</span><span class="n">u_char</span> <span class="o">*</span><span class="p">)</span> <span class="n">ngx_argv</span><span class="p">[</span><span class="n">i</span><span class="p">],</span> <span class="p">(</span><span class="n">u_char</span> <span class="o">*</span><span class="p">)</span> <span class="n">argv</span><span class="p">[</span><span class="n">i</span><span class="p">],</span> <span class="n">len</span><span class="p">);</span>
+    <span class="p">}</span>
+
+    <span class="n">ngx_argv</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+<span class="cp">#endif
+</span>
+    <span class="n">ngx_os_environ</span> <span class="o">=</span> <span class="n">environ</span><span class="p">;</span>
+
+    <span class="k">return</span> <span class="n">NGX_OK</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre>
+</div>
+
+<p>ngx_process_options()函數，與上文ngx_get_options()函數相呼應，用於把從命令中獲得的參數賦值到init_cycle的變量。
+在ngx_get_process()解析命令時，若用戶用p指令配置了nginx的prefix，那麼ngx_prefix變量不為NULL，此時把該值賦值到cycle的conf_prefix和prefix變量中；若用戶沒有使用該命令，則根據objs/ngx_auto_config.h頭文件中預設的值來配置這兩個變量。</p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/core/nginx.c 897~990
+</span>
+<span class="k">static</span> <span class="n">ngx_int_t</span>
+<span class="nf">ngx_process_options</span><span class="p">(</span><span class="n">ngx_cycle_t</span> <span class="o">*</span><span class="n">cycle</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="n">u_char</span>  <span class="o">*</span><span class="n">p</span><span class="p">;</span>
+    <span class="kt">size_t</span>   <span class="n">len</span><span class="p">;</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">ngx_prefix</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">len</span> <span class="o">=</span> <span class="n">ngx_strlen</span><span class="p">(</span><span class="n">ngx_prefix</span><span class="p">);</span>
+        <span class="n">p</span> <span class="o">=</span> <span class="n">ngx_prefix</span><span class="p">;</span>
+
+        <span class="k">if</span> <span class="p">(</span><span class="n">len</span> <span class="o">&amp;&amp;</span> <span class="o">!</span><span class="n">ngx_path_separator</span><span class="p">(</span><span class="n">p</span><span class="p">[</span><span class="n">len</span> <span class="o">-</span> <span class="mi">1</span><span class="p">]))</span> <span class="p">{</span>
+            <span class="n">p</span> <span class="o">=</span> <span class="n">ngx_pnalloc</span><span class="p">(</span><span class="n">cycle</span><span class="o">-&gt;</span><span class="n">pool</span><span class="p">,</span> <span class="n">len</span> <span class="o">+</span> <span class="mi">1</span><span class="p">);</span>
+            <span class="k">if</span> <span class="p">(</span><span class="n">p</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+                <span class="k">return</span> <span class="n">NGX_ERROR</span><span class="p">;</span>
+            <span class="p">}</span>
+
+            <span class="n">ngx_memcpy</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">ngx_prefix</span><span class="p">,</span> <span class="n">len</span><span class="p">);</span>
+            <span class="n">p</span><span class="p">[</span><span class="n">len</span><span class="o">++</span><span class="p">]</span> <span class="o">=</span> <span class="sc">'/'</span><span class="p">;</span>
+        <span class="p">}</span>
+
+        <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">conf_prefix</span><span class="p">.</span><span class="n">len</span> <span class="o">=</span> <span class="n">len</span><span class="p">;</span>
+        <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">conf_prefix</span><span class="p">.</span><span class="n">data</span> <span class="o">=</span> <span class="n">p</span><span class="p">;</span>
+        <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">prefix</span><span class="p">.</span><span class="n">len</span> <span class="o">=</span> <span class="n">len</span><span class="p">;</span>
+        <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">prefix</span><span class="p">.</span><span class="n">data</span> <span class="o">=</span> <span class="n">p</span><span class="p">;</span>
+
+    <span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+
+<span class="cp">#ifndef NGX_PREFIX
+</span>
+        <span class="n">p</span> <span class="o">=</span> <span class="n">ngx_pnalloc</span><span class="p">(</span><span class="n">cycle</span><span class="o">-&gt;</span><span class="n">pool</span><span class="p">,</span> <span class="n">NGX_MAX_PATH</span><span class="p">);</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">p</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+            <span class="k">return</span> <span class="n">NGX_ERROR</span><span class="p">;</span>
+        <span class="p">}</span>
+
+        <span class="k">if</span> <span class="p">(</span><span class="n">ngx_getcwd</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">NGX_MAX_PATH</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+            <span class="n">ngx_log_stderr</span><span class="p">(</span><span class="n">ngx_errno</span><span class="p">,</span> <span class="s">"[emerg]: "</span> <span class="n">ngx_getcwd_n</span> <span class="s">" failed"</span><span class="p">);</span>
+            <span class="k">return</span> <span class="n">NGX_ERROR</span><span class="p">;</span>
+        <span class="p">}</span>
+
+        <span class="n">len</span> <span class="o">=</span> <span class="n">ngx_strlen</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+
+        <span class="n">p</span><span class="p">[</span><span class="n">len</span><span class="o">++</span><span class="p">]</span> <span class="o">=</span> <span class="sc">'/'</span><span class="p">;</span>
+
+        <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">conf_prefix</span><span class="p">.</span><span class="n">len</span> <span class="o">=</span> <span class="n">len</span><span class="p">;</span>
+        <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">conf_prefix</span><span class="p">.</span><span class="n">data</span> <span class="o">=</span> <span class="n">p</span><span class="p">;</span>
+        <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">prefix</span><span class="p">.</span><span class="n">len</span> <span class="o">=</span> <span class="n">len</span><span class="p">;</span>
+        <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">prefix</span><span class="p">.</span><span class="n">data</span> <span class="o">=</span> <span class="n">p</span><span class="p">;</span>
+
+<span class="cp">#else
+</span>
+<span class="cp">#ifdef NGX_CONF_PREFIX
+</span>        <span class="n">ngx_str_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cycle</span><span class="o">-&gt;</span><span class="n">conf_prefix</span><span class="p">,</span> <span class="n">NGX_CONF_PREFIX</span><span class="p">);</span>
+<span class="cp">#else
+</span>        <span class="n">ngx_str_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cycle</span><span class="o">-&gt;</span><span class="n">conf_prefix</span><span class="p">,</span> <span class="n">NGX_PREFIX</span><span class="p">);</span>
+<span class="cp">#endif
+</span>        <span class="n">ngx_str_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cycle</span><span class="o">-&gt;</span><span class="n">prefix</span><span class="p">,</span> <span class="n">NGX_PREFIX</span><span class="p">);</span>
+
+<span class="cp">#endif
+</span>    <span class="p">}</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">ngx_conf_file</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">conf_file</span><span class="p">.</span><span class="n">len</span> <span class="o">=</span> <span class="n">ngx_strlen</span><span class="p">(</span><span class="n">ngx_conf_file</span><span class="p">);</span>
+        <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">conf_file</span><span class="p">.</span><span class="n">data</span> <span class="o">=</span> <span class="n">ngx_conf_file</span><span class="p">;</span>
+
+    <span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+        <span class="n">ngx_str_set</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cycle</span><span class="o">-&gt;</span><span class="n">conf_file</span><span class="p">,</span> <span class="n">NGX_CONF_PATH</span><span class="p">);</span>
+    <span class="p">}</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">ngx_conf_full_name</span><span class="p">(</span><span class="n">cycle</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">cycle</span><span class="o">-&gt;</span><span class="n">conf_file</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">!=</span> <span class="n">NGX_OK</span><span class="p">)</span> <span class="p">{</span>
+        <span class="k">return</span> <span class="n">NGX_ERROR</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="k">for</span> <span class="p">(</span><span class="n">p</span> <span class="o">=</span> <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">conf_file</span><span class="p">.</span><span class="n">data</span> <span class="o">+</span> <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">conf_file</span><span class="p">.</span><span class="n">len</span> <span class="o">-</span> <span class="mi">1</span><span class="p">;</span>
+         <span class="n">p</span> <span class="o">&gt;</span> <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">conf_file</span><span class="p">.</span><span class="n">data</span><span class="p">;</span>
+         <span class="n">p</span><span class="o">--</span><span class="p">)</span>
+    <span class="p">{</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">ngx_path_separator</span><span class="p">(</span><span class="o">*</span><span class="n">p</span><span class="p">))</span> <span class="p">{</span>
+            <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">conf_prefix</span><span class="p">.</span><span class="n">len</span> <span class="o">=</span> <span class="n">p</span> <span class="o">-</span> <span class="n">ngx_cycle</span><span class="o">-&gt;</span><span class="n">conf_file</span><span class="p">.</span><span class="n">data</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span>
+            <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">conf_prefix</span><span class="p">.</span><span class="n">data</span> <span class="o">=</span> <span class="n">ngx_cycle</span><span class="o">-&gt;</span><span class="n">conf_file</span><span class="p">.</span><span class="n">data</span><span class="p">;</span>
+            <span class="k">break</span><span class="p">;</span>
+        <span class="p">}</span>
+    <span class="p">}</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">ngx_conf_params</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">conf_param</span><span class="p">.</span><span class="n">len</span> <span class="o">=</span> <span class="n">ngx_strlen</span><span class="p">(</span><span class="n">ngx_conf_params</span><span class="p">);</span>
+        <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">conf_param</span><span class="p">.</span><span class="n">data</span> <span class="o">=</span> <span class="n">ngx_conf_params</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">ngx_test_config</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">log</span><span class="o">-&gt;</span><span class="n">log_level</span> <span class="o">=</span> <span class="n">NGX_LOG_INFO</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="k">return</span> <span class="n">NGX_OK</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre>
+</div>
+
+<p>同理，ngx_conf_file、ngx_conf_params和ngx_test_config分別為-c、-g和-t命令的配置。</p>
+
+<p>##8. 調用ngx_os_init()進行平台相關初始化</p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/core/nginx.c 257~267
+</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">ngx_os_init</span><span class="p">(</span><span class="n">log</span><span class="p">)</span> <span class="o">!=</span> <span class="n">NGX_OK</span><span class="p">)</span> <span class="p">{</span>
+        <span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="cm">/*
+     * ngx_crc32_table_init() requires ngx_cacheline_size set in ngx_os_init()
+     */</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">ngx_crc32_table_init</span><span class="p">()</span> <span class="o">!=</span> <span class="n">NGX_OK</span><span class="p">)</span> <span class="p">{</span>
+        <span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+    <span class="p">}</span>
+</code></pre>
+</div>
+
+<p>ngx_os_init()函數，用於進行平台相關的初始化動作，用條件編譯的方式來決定是否進行平台差異的初始化，如在darwin內核下即根據os/unix/ngx_darwin_init.c來進行初始化，而條件編譯的宏定義與各自平台的os/unix/ngx_<os>\_config.h頭文件中，這個頭文件在configure期間被決定。而ngx\_init\_setproctitle，則用於設定當前進程的標題。接下來即是獲取ngx\_pagesize系統分頁大小以及CPU相關特徵的代碼。</os></p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/os/unix/ngx_posix_init.c 34~85
+</span>
+<span class="n">ngx_int_t</span>
+<span class="nf">ngx_os_init</span><span class="p">(</span><span class="n">ngx_log_t</span> <span class="o">*</span><span class="n">log</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="n">ngx_time_t</span>  <span class="o">*</span><span class="n">tp</span><span class="p">;</span>
+    <span class="n">ngx_uint_t</span>   <span class="n">n</span><span class="p">;</span>
+
+<span class="cp">#if (NGX_HAVE_OS_SPECIFIC_INIT)
+</span>    <span class="k">if</span> <span class="p">(</span><span class="n">ngx_os_specific_init</span><span class="p">(</span><span class="n">log</span><span class="p">)</span> <span class="o">!=</span> <span class="n">NGX_OK</span><span class="p">)</span> <span class="p">{</span>
+        <span class="k">return</span> <span class="n">NGX_ERROR</span><span class="p">;</span>
+    <span class="p">}</span>
+<span class="cp">#endif
+</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">ngx_init_setproctitle</span><span class="p">(</span><span class="n">log</span><span class="p">)</span> <span class="o">!=</span> <span class="n">NGX_OK</span><span class="p">)</span> <span class="p">{</span>
+        <span class="k">return</span> <span class="n">NGX_ERROR</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="n">ngx_pagesize</span> <span class="o">=</span> <span class="n">getpagesize</span><span class="p">();</span>
+    <span class="n">ngx_cacheline_size</span> <span class="o">=</span> <span class="n">NGX_CPU_CACHE_LINE</span><span class="p">;</span>
+
+    <span class="k">for</span> <span class="p">(</span><span class="n">n</span> <span class="o">=</span> <span class="n">ngx_pagesize</span><span class="p">;</span> <span class="n">n</span> <span class="o">&gt;&gt;=</span> <span class="mi">1</span><span class="p">;</span> <span class="n">ngx_pagesize_shift</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span> <span class="cm">/* void */</span> <span class="p">}</span>
+
+<span class="cp">#if (NGX_HAVE_SC_NPROCESSORS_ONLN)
+</span>    <span class="k">if</span> <span class="p">(</span><span class="n">ngx_ncpu</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">ngx_ncpu</span> <span class="o">=</span> <span class="n">sysconf</span><span class="p">(</span><span class="n">_SC_NPROCESSORS_ONLN</span><span class="p">);</span>
+    <span class="p">}</span>
+<span class="cp">#endif
+</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">ngx_ncpu</span> <span class="o">&lt;</span> <span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">ngx_ncpu</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="n">ngx_cpuinfo</span><span class="p">();</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">getrlimit</span><span class="p">(</span><span class="n">RLIMIT_NOFILE</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">rlmt</span><span class="p">)</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">ngx_log_error</span><span class="p">(</span><span class="n">NGX_LOG_ALERT</span><span class="p">,</span> <span class="n">log</span><span class="p">,</span> <span class="n">errno</span><span class="p">,</span>
+                      <span class="s">"getrlimit(RLIMIT_NOFILE) failed"</span><span class="p">);</span>
+        <span class="k">return</span> <span class="n">NGX_ERROR</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="n">ngx_max_sockets</span> <span class="o">=</span> <span class="p">(</span><span class="n">ngx_int_t</span><span class="p">)</span> <span class="n">rlmt</span><span class="p">.</span><span class="n">rlim_cur</span><span class="p">;</span>
+
+<span class="cp">#if (NGX_HAVE_INHERITED_NONBLOCK || NGX_HAVE_ACCEPT4)
+</span>    <span class="n">ngx_inherited_nonblocking</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+<span class="cp">#else
+</span>    <span class="n">ngx_inherited_nonblocking</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+<span class="cp">#endif
+</span>
+    <span class="n">tp</span> <span class="o">=</span> <span class="n">ngx_timeofday</span><span class="p">();</span>
+    <span class="n">srandom</span><span class="p">(((</span><span class="kt">unsigned</span><span class="p">)</span> <span class="n">ngx_pid</span> <span class="o">&lt;&lt;</span> <span class="mi">16</span><span class="p">)</span> <span class="o">^</span> <span class="n">tp</span><span class="o">-&gt;</span><span class="n">sec</span> <span class="o">^</span> <span class="n">tp</span><span class="o">-&gt;</span><span class="n">msec</span><span class="p">);</span>
+
+    <span class="k">return</span> <span class="n">NGX_OK</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre>
+</div>
+
+<p>在ngx_os_init()函數執行之後，nginx才可以執行平台依賴相關的代碼，例如接下來要執行的依賴cacheline_size的ngx_crc32_table_init()函數。</p>
+
+<p>##9. ngx_add_inherited_sockets()與平滑升降級</p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/core/nginx.c 269~271
+</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">ngx_add_inherited_sockets</span><span class="p">(</span><span class="o">&amp;</span><span class="n">init_cycle</span><span class="p">)</span> <span class="o">!=</span> <span class="n">NGX_OK</span><span class="p">)</span> <span class="p">{</span>
+        <span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+    <span class="p">}</span>
+</code></pre>
+</div>
+
+<p>首先我們要搞清楚為什麼有添加繼承socket這一步：因為nginx支持熱重啓，那麼在熱重啓之後，nginx想要直接通過監聽socket的fd來實現繼續監聽，而不是關閉本來的fd然後重新創建一個。其實，ngx_add_inherited_sockets還有一個對應的函數——ngx_exec_new_binary，顧名思義，是運行新的二進制文件時調用的函數，也就是平滑升降級nginx時會用到的函數。此函數會把當前監聽的socket文件描述符格式化為以分號為分割的字符串，並把其賦值到以NGINX_VAR為key的環境變量中。而ngx_add_inherited_sockets則是通過環境變量</p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/core/nginx.c 437~497
+</span>
+<span class="k">static</span> <span class="n">ngx_int_t</span>
+<span class="nf">ngx_add_inherited_sockets</span><span class="p">(</span><span class="n">ngx_cycle_t</span> <span class="o">*</span><span class="n">cycle</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="n">u_char</span>           <span class="o">*</span><span class="n">p</span><span class="p">,</span> <span class="o">*</span><span class="n">v</span><span class="p">,</span> <span class="o">*</span><span class="n">inherited</span><span class="p">;</span>
+    <span class="n">ngx_int_t</span>         <span class="n">s</span><span class="p">;</span>
+    <span class="n">ngx_listening_t</span>  <span class="o">*</span><span class="n">ls</span><span class="p">;</span>
+
+    <span class="n">inherited</span> <span class="o">=</span> <span class="p">(</span><span class="n">u_char</span> <span class="o">*</span><span class="p">)</span> <span class="n">getenv</span><span class="p">(</span><span class="n">NGINX_VAR</span><span class="p">);</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">inherited</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+        <span class="k">return</span> <span class="n">NGX_OK</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="n">ngx_log_error</span><span class="p">(</span><span class="n">NGX_LOG_NOTICE</span><span class="p">,</span> <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span>
+                  <span class="s">"using inherited sockets from </span><span class="se">\"</span><span class="s">%s</span><span class="se">\"</span><span class="s">"</span><span class="p">,</span> <span class="n">inherited</span><span class="p">);</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">ngx_array_init</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cycle</span><span class="o">-&gt;</span><span class="n">listening</span><span class="p">,</span> <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">pool</span><span class="p">,</span> <span class="mi">10</span><span class="p">,</span>
+                       <span class="k">sizeof</span><span class="p">(</span><span class="n">ngx_listening_t</span><span class="p">))</span>
+        <span class="o">!=</span> <span class="n">NGX_OK</span><span class="p">)</span>
+    <span class="p">{</span>
+        <span class="k">return</span> <span class="n">NGX_ERROR</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="k">for</span> <span class="p">(</span><span class="n">p</span> <span class="o">=</span> <span class="n">inherited</span><span class="p">,</span> <span class="n">v</span> <span class="o">=</span> <span class="n">p</span><span class="p">;</span> <span class="o">*</span><span class="n">p</span><span class="p">;</span> <span class="n">p</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+        <span class="k">if</span> <span class="p">(</span><span class="o">*</span><span class="n">p</span> <span class="o">==</span> <span class="sc">':'</span> <span class="o">||</span> <span class="o">*</span><span class="n">p</span> <span class="o">==</span> <span class="sc">';'</span><span class="p">)</span> <span class="p">{</span>
+            <span class="n">s</span> <span class="o">=</span> <span class="n">ngx_atoi</span><span class="p">(</span><span class="n">v</span><span class="p">,</span> <span class="n">p</span> <span class="o">-</span> <span class="n">v</span><span class="p">);</span>
+            <span class="k">if</span> <span class="p">(</span><span class="n">s</span> <span class="o">==</span> <span class="n">NGX_ERROR</span><span class="p">)</span> <span class="p">{</span>
+                <span class="n">ngx_log_error</span><span class="p">(</span><span class="n">NGX_LOG_EMERG</span><span class="p">,</span> <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span>
+                              <span class="s">"invalid socket number </span><span class="se">\"</span><span class="s">%s</span><span class="se">\"</span><span class="s"> in "</span> <span class="n">NGINX_VAR</span>
+                              <span class="s">" environment variable, ignoring the rest"</span>
+                              <span class="s">" of the variable"</span><span class="p">,</span> <span class="n">v</span><span class="p">);</span>
+                <span class="k">break</span><span class="p">;</span>
+            <span class="p">}</span>
+
+            <span class="n">v</span> <span class="o">=</span> <span class="n">p</span> <span class="o">+</span> <span class="mi">1</span><span class="p">;</span>
+
+            <span class="n">ls</span> <span class="o">=</span> <span class="n">ngx_array_push</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cycle</span><span class="o">-&gt;</span><span class="n">listening</span><span class="p">);</span>
+            <span class="k">if</span> <span class="p">(</span><span class="n">ls</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+                <span class="k">return</span> <span class="n">NGX_ERROR</span><span class="p">;</span>
+            <span class="p">}</span>
+
+            <span class="n">ngx_memzero</span><span class="p">(</span><span class="n">ls</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">ngx_listening_t</span><span class="p">));</span>
+
+            <span class="n">ls</span><span class="o">-&gt;</span><span class="n">fd</span> <span class="o">=</span> <span class="p">(</span><span class="n">ngx_socket_t</span><span class="p">)</span> <span class="n">s</span><span class="p">;</span>
+        <span class="p">}</span>
+    <span class="p">}</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">v</span> <span class="o">!=</span> <span class="n">p</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">ngx_log_error</span><span class="p">(</span><span class="n">NGX_LOG_EMERG</span><span class="p">,</span> <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span>
+                      <span class="s">"invalid socket number </span><span class="se">\"</span><span class="s">%s</span><span class="se">\"</span><span class="s"> in "</span> <span class="n">NGINX_VAR</span>
+                      <span class="s">" environment variable, ignoring"</span><span class="p">,</span> <span class="n">v</span><span class="p">);</span>
+    <span class="p">}</span>
+
+    <span class="n">ngx_inherited</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+
+    <span class="k">return</span> <span class="n">ngx_set_inherited_sockets</span><span class="p">(</span><span class="n">cycle</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre>
+</div>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/core/nginx.c 626~724
+</span>
+<span class="n">ngx_pid_t</span>
+<span class="nf">ngx_exec_new_binary</span><span class="p">(</span><span class="n">ngx_cycle_t</span> <span class="o">*</span><span class="n">cycle</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="k">const</span> <span class="o">*</span><span class="n">argv</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="kt">char</span>             <span class="o">**</span><span class="n">env</span><span class="p">,</span> <span class="o">*</span><span class="n">var</span><span class="p">;</span>
+    <span class="n">u_char</span>            <span class="o">*</span><span class="n">p</span><span class="p">;</span>
+    <span class="n">ngx_uint_t</span>         <span class="n">i</span><span class="p">,</span> <span class="n">n</span><span class="p">;</span>
+    <span class="n">ngx_pid_t</span>          <span class="n">pid</span><span class="p">;</span>
+    <span class="n">ngx_exec_ctx_t</span>     <span class="n">ctx</span><span class="p">;</span>
+    <span class="n">ngx_core_conf_t</span>   <span class="o">*</span><span class="n">ccf</span><span class="p">;</span>
+    <span class="n">ngx_listening_t</span>   <span class="o">*</span><span class="n">ls</span><span class="p">;</span>
+
+    <span class="n">ngx_memzero</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ctx</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">ngx_exec_ctx_t</span><span class="p">));</span>
+
+    <span class="n">ctx</span><span class="p">.</span><span class="n">path</span> <span class="o">=</span> <span class="n">argv</span><span class="p">[</span><span class="mi">0</span><span class="p">];</span>
+    <span class="n">ctx</span><span class="p">.</span><span class="n">name</span> <span class="o">=</span> <span class="s">"new binary process"</span><span class="p">;</span>
+    <span class="n">ctx</span><span class="p">.</span><span class="n">argv</span> <span class="o">=</span> <span class="n">argv</span><span class="p">;</span>
+
+    <span class="n">n</span> <span class="o">=</span> <span class="mi">2</span><span class="p">;</span>
+    <span class="n">env</span> <span class="o">=</span> <span class="n">ngx_set_environment</span><span class="p">(</span><span class="n">cycle</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">n</span><span class="p">);</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">env</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+        <span class="k">return</span> <span class="n">NGX_INVALID_PID</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="n">var</span> <span class="o">=</span> <span class="n">ngx_alloc</span><span class="p">(</span><span class="k">sizeof</span><span class="p">(</span><span class="n">NGINX_VAR</span><span class="p">)</span>
+                    <span class="o">+</span> <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">listening</span><span class="p">.</span><span class="n">nelts</span> <span class="o">*</span> <span class="p">(</span><span class="n">NGX_INT32_LEN</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">+</span> <span class="mi">2</span><span class="p">,</span>
+                    <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">);</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">var</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">ngx_free</span><span class="p">(</span><span class="n">env</span><span class="p">);</span>
+        <span class="k">return</span> <span class="n">NGX_INVALID_PID</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="n">p</span> <span class="o">=</span> <span class="n">ngx_cpymem</span><span class="p">(</span><span class="n">var</span><span class="p">,</span> <span class="n">NGINX_VAR</span> <span class="s">"="</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">NGINX_VAR</span><span class="p">));</span>
+
+    <span class="n">ls</span> <span class="o">=</span> <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">listening</span><span class="p">.</span><span class="n">elts</span><span class="p">;</span>
+    <span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">listening</span><span class="p">.</span><span class="n">nelts</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">p</span> <span class="o">=</span> <span class="n">ngx_sprintf</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="s">"%ud;"</span><span class="p">,</span> <span class="n">ls</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">fd</span><span class="p">);</span>
+    <span class="p">}</span>
+
+    <span class="o">*</span><span class="n">p</span> <span class="o">=</span> <span class="sc">'\0'</span><span class="p">;</span>
+
+    <span class="n">env</span><span class="p">[</span><span class="n">n</span><span class="o">++</span><span class="p">]</span> <span class="o">=</span> <span class="n">var</span><span class="p">;</span>
+
+<span class="cp">#if (NGX_SETPROCTITLE_USES_ENV)
+</span>
+    <span class="cm">/* allocate the spare 300 bytes for the new binary process title */</span>
+
+    <span class="n">env</span><span class="p">[</span><span class="n">n</span><span class="o">++</span><span class="p">]</span> <span class="o">=</span> <span class="s">"SPARE=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"</span>
+               <span class="s">"XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"</span>
+               <span class="s">"XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"</span>
+               <span class="s">"XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"</span>
+               <span class="s">"XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"</span><span class="p">;</span>
+
+<span class="cp">#endif
+</span>
+    <span class="n">env</span><span class="p">[</span><span class="n">n</span><span class="p">]</span> <span class="o">=</span> <span class="nb">NULL</span><span class="p">;</span>
+
+<span class="cp">#if (NGX_DEBUG)
+</span>    <span class="p">{</span>
+    <span class="kt">char</span>  <span class="o">**</span><span class="n">e</span><span class="p">;</span>
+    <span class="k">for</span> <span class="p">(</span><span class="n">e</span> <span class="o">=</span> <span class="n">env</span><span class="p">;</span> <span class="o">*</span><span class="n">e</span><span class="p">;</span> <span class="n">e</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">ngx_log_debug1</span><span class="p">(</span><span class="n">NGX_LOG_DEBUG_CORE</span><span class="p">,</span> <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="s">"env: %s"</span><span class="p">,</span> <span class="o">*</span><span class="n">e</span><span class="p">);</span>
+    <span class="p">}</span>
+    <span class="p">}</span>
+<span class="cp">#endif
+</span>
+    <span class="n">ctx</span><span class="p">.</span><span class="n">envp</span> <span class="o">=</span> <span class="p">(</span><span class="kt">char</span> <span class="o">*</span><span class="k">const</span> <span class="o">*</span><span class="p">)</span> <span class="n">env</span><span class="p">;</span>
+
+    <span class="n">ccf</span> <span class="o">=</span> <span class="p">(</span><span class="n">ngx_core_conf_t</span> <span class="o">*</span><span class="p">)</span> <span class="n">ngx_get_conf</span><span class="p">(</span><span class="n">cycle</span><span class="o">-&gt;</span><span class="n">conf_ctx</span><span class="p">,</span> <span class="n">ngx_core_module</span><span class="p">);</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">ngx_rename_file</span><span class="p">(</span><span class="n">ccf</span><span class="o">-&gt;</span><span class="n">pid</span><span class="p">.</span><span class="n">data</span><span class="p">,</span> <span class="n">ccf</span><span class="o">-&gt;</span><span class="n">oldpid</span><span class="p">.</span><span class="n">data</span><span class="p">)</span> <span class="o">==</span> <span class="n">NGX_FILE_ERROR</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">ngx_log_error</span><span class="p">(</span><span class="n">NGX_LOG_ALERT</span><span class="p">,</span> <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">,</span> <span class="n">ngx_errno</span><span class="p">,</span>
+                      <span class="n">ngx_rename_file_n</span> <span class="s">" %s to %s failed "</span>
+                      <span class="s">"before executing new binary process </span><span class="se">\"</span><span class="s">%s</span><span class="se">\"</span><span class="s">"</span><span class="p">,</span>
+                      <span class="n">ccf</span><span class="o">-&gt;</span><span class="n">pid</span><span class="p">.</span><span class="n">data</span><span class="p">,</span> <span class="n">ccf</span><span class="o">-&gt;</span><span class="n">oldpid</span><span class="p">.</span><span class="n">data</span><span class="p">,</span> <span class="n">argv</span><span class="p">[</span><span class="mi">0</span><span class="p">]);</span>
+
+        <span class="n">ngx_free</span><span class="p">(</span><span class="n">env</span><span class="p">);</span>
+        <span class="n">ngx_free</span><span class="p">(</span><span class="n">var</span><span class="p">);</span>
+
+        <span class="k">return</span> <span class="n">NGX_INVALID_PID</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="n">pid</span> <span class="o">=</span> <span class="n">ngx_execute</span><span class="p">(</span><span class="n">cycle</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">ctx</span><span class="p">);</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">pid</span> <span class="o">==</span> <span class="n">NGX_INVALID_PID</span><span class="p">)</span> <span class="p">{</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">ngx_rename_file</span><span class="p">(</span><span class="n">ccf</span><span class="o">-&gt;</span><span class="n">oldpid</span><span class="p">.</span><span class="n">data</span><span class="p">,</span> <span class="n">ccf</span><span class="o">-&gt;</span><span class="n">pid</span><span class="p">.</span><span class="n">data</span><span class="p">)</span>
+            <span class="o">==</span> <span class="n">NGX_FILE_ERROR</span><span class="p">)</span>
+        <span class="p">{</span>
+            <span class="n">ngx_log_error</span><span class="p">(</span><span class="n">NGX_LOG_ALERT</span><span class="p">,</span> <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">,</span> <span class="n">ngx_errno</span><span class="p">,</span>
+                          <span class="n">ngx_rename_file_n</span> <span class="s">" %s back to %s failed after "</span>
+                          <span class="s">"an attempt to execute new binary process </span><span class="se">\"</span><span class="s">%s</span><span class="se">\"</span><span class="s">"</span><span class="p">,</span>
+                          <span class="n">ccf</span><span class="o">-&gt;</span><span class="n">oldpid</span><span class="p">.</span><span class="n">data</span><span class="p">,</span> <span class="n">ccf</span><span class="o">-&gt;</span><span class="n">pid</span><span class="p">.</span><span class="n">data</span><span class="p">,</span> <span class="n">argv</span><span class="p">[</span><span class="mi">0</span><span class="p">]);</span>
+        <span class="p">}</span>
+    <span class="p">}</span>
+
+    <span class="n">ngx_free</span><span class="p">(</span><span class="n">env</span><span class="p">);</span>
+    <span class="n">ngx_free</span><span class="p">(</span><span class="n">var</span><span class="p">);</span>
+
+    <span class="k">return</span> <span class="n">pid</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre>
+</div>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// auto/install 210~217
+</span>
+<span class="n">upgrade</span><span class="o">:</span>
+	<span class="err">$</span><span class="n">NGX_SBIN_PATH</span> <span class="o">-</span><span class="n">t</span>
+
+	<span class="n">kill</span> <span class="o">-</span><span class="n">USR2</span> <span class="err">\`</span><span class="n">cat</span> <span class="err">$</span><span class="n">NGX_PID_PATH</span><span class="err">\`</span>
+	<span class="n">sleep</span> <span class="mi">1</span>
+	<span class="n">test</span> <span class="o">-</span><span class="n">f</span> <span class="err">$</span><span class="n">NGX_PID_PATH</span><span class="p">.</span><span class="n">oldbin</span>
+
+	<span class="n">kill</span> <span class="o">-</span><span class="n">QUIT</span> <span class="err">\`</span><span class="n">cat</span> <span class="err">$</span><span class="n">NGX_PID_PATH</span><span class="p">.</span><span class="n">oldbin</span><span class="err">\`</span>
+</code></pre>
+</div>
+
+<p>##10. modules的預加載與init_cycle的初始化</p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/core/nginx.c 273~285
+</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">ngx_preinit_modules</span><span class="p">()</span> <span class="o">!=</span> <span class="n">NGX_OK</span><span class="p">)</span> <span class="p">{</span>
+        <span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="n">cycle</span> <span class="o">=</span> <span class="n">ngx_init_cycle</span><span class="p">(</span><span class="o">&amp;</span><span class="n">init_cycle</span><span class="p">);</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">cycle</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">ngx_test_config</span><span class="p">)</span> <span class="p">{</span>
+            <span class="n">ngx_log_stderr</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="s">"configuration file %s test failed"</span><span class="p">,</span>
+                           <span class="n">init_cycle</span><span class="p">.</span><span class="n">conf_file</span><span class="p">.</span><span class="n">data</span><span class="p">);</span>
+        <span class="p">}</span>
+
+        <span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+    <span class="p">}</span>
+</code></pre>
+</div>
+
+<p>接下來將調用ngx_init_cycle()來對init_cycle變量進行初始化，但是在此之前，先要調用ngx_preinit_modules()預初始化所有的模塊。</p>
+
+<p>ngx_preinit_modules()函數的定義位於core/ngx_module.c中，通過遍歷ngx_modules數組來調用其模塊的初始化函數的函數指針。而ngx_modules變量位於objs/ngx_modules.c源文件中，也就是說需要加載的模塊是在configure script執行的時候決定的。</p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/core/ngx_module.c 25~39
+</span>
+<span class="n">ngx_int_t</span>
+<span class="nf">ngx_preinit_modules</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="n">ngx_uint_t</span>  <span class="n">i</span><span class="p">;</span>
+
+    <span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">ngx_modules</span><span class="p">[</span><span class="n">i</span><span class="p">];</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">ngx_modules</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">-&gt;</span><span class="n">index</span> <span class="o">=</span> <span class="n">i</span><span class="p">;</span>
+        <span class="n">ngx_modules</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">-&gt;</span><span class="n">name</span> <span class="o">=</span> <span class="n">ngx_module_names</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+    <span class="p">}</span>
+
+    <span class="n">ngx_modules_n</span> <span class="o">=</span> <span class="n">i</span><span class="p">;</span>
+    <span class="n">ngx_max_module</span> <span class="o">=</span> <span class="n">ngx_modules_n</span> <span class="o">+</span> <span class="n">NGX_MAX_DYNAMIC_MODULES</span><span class="p">;</span>
+
+    <span class="k">return</span> <span class="n">NGX_OK</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre>
+</div>
+
+<p>接下來是ngx_init_cycle()函數，其定義於src/core/ngx_cycle.c，在這個函數的執行過程中，切切實實地對init_cycle中的大部份變量進行了初始化和賦值，如cycle的log日誌、pool內存池、conf_*配置文件相關、open_files正在打開的文件和shared_memory共享內存等。</p>
+
+<p>第39～53行，函數變量的聲明。</p>
+
+<p>第55～62行，通過環境變量設定的時區，更新當前的時區，同時再用ngx_timezone_update()更新一次當前時間，因為當前還沒開始用handler來更新時間，為了獲取當前的最新時間，需要手動調用一次。然後創建內存池。</p>
+
+<p>第73～81行，通過剛才創建的pool內存池來創建cycle的空間，並把pool、log、old_cycle等變量賦值回cycle結構體中。至於為什麼要把在main函數棧上的init_cycle變量作為old_cycle，然後創建新的cycle變量，大概是因為nginx想把cycle從main函數棧空間上改為在內存池中。</p>
+
+<p>第83～111行，把old_cycle的prefix和conf_*複製到pool中，使用了pool字符串賦值函數ngx_pstrdup()函數，即pool string duplicate的意思。</p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/core/ngx_cycle.c 36~111
+</span>
+<span class="n">ngx_cycle_t</span> <span class="o">*</span>
+<span class="nf">ngx_init_cycle</span><span class="p">(</span><span class="n">ngx_cycle_t</span> <span class="o">*</span><span class="n">old_cycle</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="kt">void</span>                <span class="o">*</span><span class="n">rv</span><span class="p">;</span>
+    <span class="kt">char</span>               <span class="o">**</span><span class="n">senv</span><span class="p">;</span>
+    <span class="n">ngx_uint_t</span>           <span class="n">i</span><span class="p">,</span> <span class="n">n</span><span class="p">;</span>
+    <span class="n">ngx_log_t</span>           <span class="o">*</span><span class="n">log</span><span class="p">;</span>
+    <span class="n">ngx_time_t</span>          <span class="o">*</span><span class="n">tp</span><span class="p">;</span>
+    <span class="n">ngx_conf_t</span>           <span class="n">conf</span><span class="p">;</span>
+    <span class="n">ngx_pool_t</span>          <span class="o">*</span><span class="n">pool</span><span class="p">;</span>
+    <span class="n">ngx_cycle_t</span>         <span class="o">*</span><span class="n">cycle</span><span class="p">,</span> <span class="o">**</span><span class="n">old</span><span class="p">;</span>
+    <span class="n">ngx_shm_zone_t</span>      <span class="o">*</span><span class="n">shm_zone</span><span class="p">,</span> <span class="o">*</span><span class="n">oshm_zone</span><span class="p">;</span>
+    <span class="n">ngx_list_part_t</span>     <span class="o">*</span><span class="n">part</span><span class="p">,</span> <span class="o">*</span><span class="n">opart</span><span class="p">;</span>
+    <span class="n">ngx_open_file_t</span>     <span class="o">*</span><span class="n">file</span><span class="p">;</span>
+    <span class="n">ngx_listening_t</span>     <span class="o">*</span><span class="n">ls</span><span class="p">,</span> <span class="o">*</span><span class="n">nls</span><span class="p">;</span>
+    <span class="n">ngx_core_conf_t</span>     <span class="o">*</span><span class="n">ccf</span><span class="p">,</span> <span class="o">*</span><span class="n">old_ccf</span><span class="p">;</span>
+    <span class="n">ngx_core_module_t</span>   <span class="o">*</span><span class="n">module</span><span class="p">;</span>
+    <span class="kt">char</span>                 <span class="n">hostname</span><span class="p">[</span><span class="n">NGX_MAXHOSTNAMELEN</span><span class="p">];</span>
+
+    <span class="n">ngx_timezone_update</span><span class="p">();</span>
+
+    <span class="cm">/* force localtime update with a new timezone */</span>
+
+    <span class="n">tp</span> <span class="o">=</span> <span class="n">ngx_timeofday</span><span class="p">();</span>
+    <span class="n">tp</span><span class="o">-&gt;</span><span class="n">sec</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+
+    <span class="n">ngx_time_update</span><span class="p">();</span>
+
+
+    <span class="n">log</span> <span class="o">=</span> <span class="n">old_cycle</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">;</span>
+
+    <span class="n">pool</span> <span class="o">=</span> <span class="n">ngx_create_pool</span><span class="p">(</span><span class="n">NGX_CYCLE_POOL_SIZE</span><span class="p">,</span> <span class="n">log</span><span class="p">);</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">pool</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+        <span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+    <span class="p">}</span>
+    <span class="n">pool</span><span class="o">-&gt;</span><span class="n">log</span> <span class="o">=</span> <span class="n">log</span><span class="p">;</span>
+
+    <span class="n">cycle</span> <span class="o">=</span> <span class="n">ngx_pcalloc</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">ngx_cycle_t</span><span class="p">));</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">cycle</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">ngx_destroy_pool</span><span class="p">(</span><span class="n">pool</span><span class="p">);</span>
+        <span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">pool</span> <span class="o">=</span> <span class="n">pool</span><span class="p">;</span>
+    <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">log</span> <span class="o">=</span> <span class="n">log</span><span class="p">;</span>
+    <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">old_cycle</span> <span class="o">=</span> <span class="n">old_cycle</span><span class="p">;</span>
+
+    <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">conf_prefix</span><span class="p">.</span><span class="n">len</span> <span class="o">=</span> <span class="n">old_cycle</span><span class="o">-&gt;</span><span class="n">conf_prefix</span><span class="p">.</span><span class="n">len</span><span class="p">;</span>
+    <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">conf_prefix</span><span class="p">.</span><span class="n">data</span> <span class="o">=</span> <span class="n">ngx_pstrdup</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">old_cycle</span><span class="o">-&gt;</span><span class="n">conf_prefix</span><span class="p">);</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">cycle</span><span class="o">-&gt;</span><span class="n">conf_prefix</span><span class="p">.</span><span class="n">data</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">ngx_destroy_pool</span><span class="p">(</span><span class="n">pool</span><span class="p">);</span>
+        <span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">prefix</span><span class="p">.</span><span class="n">len</span> <span class="o">=</span> <span class="n">old_cycle</span><span class="o">-&gt;</span><span class="n">prefix</span><span class="p">.</span><span class="n">len</span><span class="p">;</span>
+    <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">prefix</span><span class="p">.</span><span class="n">data</span> <span class="o">=</span> <span class="n">ngx_pstrdup</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">old_cycle</span><span class="o">-&gt;</span><span class="n">prefix</span><span class="p">);</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">cycle</span><span class="o">-&gt;</span><span class="n">prefix</span><span class="p">.</span><span class="n">data</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">ngx_destroy_pool</span><span class="p">(</span><span class="n">pool</span><span class="p">);</span>
+        <span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">conf_file</span><span class="p">.</span><span class="n">len</span> <span class="o">=</span> <span class="n">old_cycle</span><span class="o">-&gt;</span><span class="n">conf_file</span><span class="p">.</span><span class="n">len</span><span class="p">;</span>
+    <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">conf_file</span><span class="p">.</span><span class="n">data</span> <span class="o">=</span> <span class="n">ngx_pnalloc</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="n">old_cycle</span><span class="o">-&gt;</span><span class="n">conf_file</span><span class="p">.</span><span class="n">len</span> <span class="o">+</span> <span class="mi">1</span><span class="p">);</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">cycle</span><span class="o">-&gt;</span><span class="n">conf_file</span><span class="p">.</span><span class="n">data</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">ngx_destroy_pool</span><span class="p">(</span><span class="n">pool</span><span class="p">);</span>
+        <span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+    <span class="p">}</span>
+    <span class="n">ngx_cpystrn</span><span class="p">(</span><span class="n">cycle</span><span class="o">-&gt;</span><span class="n">conf_file</span><span class="p">.</span><span class="n">data</span><span class="p">,</span> <span class="n">old_cycle</span><span class="o">-&gt;</span><span class="n">conf_file</span><span class="p">.</span><span class="n">data</span><span class="p">,</span>
+                <span class="n">old_cycle</span><span class="o">-&gt;</span><span class="n">conf_file</span><span class="p">.</span><span class="n">len</span> <span class="o">+</span> <span class="mi">1</span><span class="p">);</span>
+
+    <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">conf_param</span><span class="p">.</span><span class="n">len</span> <span class="o">=</span> <span class="n">old_cycle</span><span class="o">-&gt;</span><span class="n">conf_param</span><span class="p">.</span><span class="n">len</span><span class="p">;</span>
+    <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">conf_param</span><span class="p">.</span><span class="n">data</span> <span class="o">=</span> <span class="n">ngx_pstrdup</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">old_cycle</span><span class="o">-&gt;</span><span class="n">conf_param</span><span class="p">);</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">cycle</span><span class="o">-&gt;</span><span class="n">conf_param</span><span class="p">.</span><span class="n">data</span> <span class="o">==</span> <span class="nb">NULL</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">ngx_destroy_pool</span><span class="p">(</span><span class="n">pool</span><span class="p">);</span>
+        <span class="k">return</span> <span class="nb">NULL</span><span class="p">;</span>
+    <span class="p">}</span>
+</code></pre>
+</div>
+
+<p>##11. 測試模式與信號處理相關</p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/core/nginx.c 287~311
+</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">ngx_test_config</span><span class="p">)</span> <span class="p">{</span>
+        <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ngx_quiet_mode</span><span class="p">)</span> <span class="p">{</span>
+            <span class="n">ngx_log_stderr</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="s">"configuration file %s test is successful"</span><span class="p">,</span>
+                           <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">conf_file</span><span class="p">.</span><span class="n">data</span><span class="p">);</span>
+        <span class="p">}</span>
+
+        <span class="k">if</span> <span class="p">(</span><span class="n">ngx_dump_config</span><span class="p">)</span> <span class="p">{</span>
+            <span class="n">cd</span> <span class="o">=</span> <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">config_dump</span><span class="p">.</span><span class="n">elts</span><span class="p">;</span>
+
+            <span class="k">for</span> <span class="p">(</span><span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">config_dump</span><span class="p">.</span><span class="n">nelts</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+
+                <span class="n">ngx_write_stdout</span><span class="p">(</span><span class="s">"# configuration file "</span><span class="p">);</span>
+                <span class="p">(</span><span class="kt">void</span><span class="p">)</span> <span class="n">ngx_write_fd</span><span class="p">(</span><span class="n">ngx_stdout</span><span class="p">,</span> <span class="n">cd</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">name</span><span class="p">.</span><span class="n">data</span><span class="p">,</span>
+                                    <span class="n">cd</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">name</span><span class="p">.</span><span class="n">len</span><span class="p">);</span>
+                <span class="n">ngx_write_stdout</span><span class="p">(</span><span class="s">":"</span> <span class="n">NGX_LINEFEED</span><span class="p">);</span>
+
+                <span class="n">b</span> <span class="o">=</span> <span class="n">cd</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">buffer</span><span class="p">;</span>
+
+                <span class="p">(</span><span class="kt">void</span><span class="p">)</span> <span class="n">ngx_write_fd</span><span class="p">(</span><span class="n">ngx_stdout</span><span class="p">,</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">pos</span><span class="p">,</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">last</span> <span class="o">-</span> <span class="n">b</span><span class="o">-&gt;</span><span class="n">pos</span><span class="p">);</span>
+                <span class="n">ngx_write_stdout</span><span class="p">(</span><span class="n">NGX_LINEFEED</span><span class="p">);</span>
+            <span class="p">}</span>
+        <span class="p">}</span>
+
+        <span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+    <span class="p">}</span>
+</code></pre>
+</div>
+
+<p>第287～311行，當為測試模式時進入該段代碼，因為之前在初始化cycle的時候已經對配置文件進行了解析，所以運行到這裡時，配置文件必定是沒有問題的。而如果配置了ngx_dump_config，證明配置文件需要被打印，用for循環把所有配置文件路徑打印到標準輸出流中。最後退出整個應用，因為測試模式的進程的任務已經完成。</p>
+
+<p>第313～315行，如果有信號需要處理，則調用定義於ngx_cycle.c源文件的的ngx_signal_process()函數，該函數通過ccf配置文件變量結構體中的pid文件路徑字符串變量，嘗試打開紀錄了pid的文件並把紀錄的pid反序列化成int類型，如果失敗，則返回1；如果成功，則把pid和信號字符串作為參數，調用ngx_os_signal_process()函數。</p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/core/nginx.c 313~315
+</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">ngx_signal</span><span class="p">)</span> <span class="p">{</span>
+        <span class="k">return</span> <span class="n">ngx_signal_process</span><span class="p">(</span><span class="n">cycle</span><span class="p">,</span> <span class="n">ngx_signal</span><span class="p">);</span>
+    <span class="p">}</span>
+</code></pre>
+</div>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/core/ngx_cycle.c 997~1048
+</span>
+<span class="n">ngx_int_t</span>
+<span class="nf">ngx_signal_process</span><span class="p">(</span><span class="n">ngx_cycle_t</span> <span class="o">*</span><span class="n">cycle</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="n">sig</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="kt">ssize_t</span>           <span class="n">n</span><span class="p">;</span>
+    <span class="n">ngx_pid_t</span>         <span class="n">pid</span><span class="p">;</span>
+    <span class="n">ngx_file_t</span>        <span class="n">file</span><span class="p">;</span>
+    <span class="n">ngx_core_conf_t</span>  <span class="o">*</span><span class="n">ccf</span><span class="p">;</span>
+    <span class="n">u_char</span>            <span class="n">buf</span><span class="p">[</span><span class="n">NGX_INT64_LEN</span> <span class="o">+</span> <span class="mi">2</span><span class="p">];</span>
+
+    <span class="n">ngx_log_error</span><span class="p">(</span><span class="n">NGX_LOG_NOTICE</span><span class="p">,</span> <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="s">"signal process started"</span><span class="p">);</span>
+
+    <span class="n">ccf</span> <span class="o">=</span> <span class="p">(</span><span class="n">ngx_core_conf_t</span> <span class="o">*</span><span class="p">)</span> <span class="n">ngx_get_conf</span><span class="p">(</span><span class="n">cycle</span><span class="o">-&gt;</span><span class="n">conf_ctx</span><span class="p">,</span> <span class="n">ngx_core_module</span><span class="p">);</span>
+
+    <span class="n">ngx_memzero</span><span class="p">(</span><span class="o">&amp;</span><span class="n">file</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">ngx_file_t</span><span class="p">));</span>
+
+    <span class="n">file</span><span class="p">.</span><span class="n">name</span> <span class="o">=</span> <span class="n">ccf</span><span class="o">-&gt;</span><span class="n">pid</span><span class="p">;</span>
+    <span class="n">file</span><span class="p">.</span><span class="n">log</span> <span class="o">=</span> <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">;</span>
+
+    <span class="n">file</span><span class="p">.</span><span class="n">fd</span> <span class="o">=</span> <span class="n">ngx_open_file</span><span class="p">(</span><span class="n">file</span><span class="p">.</span><span class="n">name</span><span class="p">.</span><span class="n">data</span><span class="p">,</span> <span class="n">NGX_FILE_RDONLY</span><span class="p">,</span>
+                            <span class="n">NGX_FILE_OPEN</span><span class="p">,</span> <span class="n">NGX_FILE_DEFAULT_ACCESS</span><span class="p">);</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">file</span><span class="p">.</span><span class="n">fd</span> <span class="o">==</span> <span class="n">NGX_INVALID_FILE</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">ngx_log_error</span><span class="p">(</span><span class="n">NGX_LOG_ERR</span><span class="p">,</span> <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">,</span> <span class="n">ngx_errno</span><span class="p">,</span>
+                      <span class="n">ngx_open_file_n</span> <span class="s">" </span><span class="se">\"</span><span class="s">%s</span><span class="se">\"</span><span class="s"> failed"</span><span class="p">,</span> <span class="n">file</span><span class="p">.</span><span class="n">name</span><span class="p">.</span><span class="n">data</span><span class="p">);</span>
+        <span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="n">n</span> <span class="o">=</span> <span class="n">ngx_read_file</span><span class="p">(</span><span class="o">&amp;</span><span class="n">file</span><span class="p">,</span> <span class="n">buf</span><span class="p">,</span> <span class="n">NGX_INT64_LEN</span> <span class="o">+</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">0</span><span class="p">);</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">ngx_close_file</span><span class="p">(</span><span class="n">file</span><span class="p">.</span><span class="n">fd</span><span class="p">)</span> <span class="o">==</span> <span class="n">NGX_FILE_ERROR</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">ngx_log_error</span><span class="p">(</span><span class="n">NGX_LOG_ALERT</span><span class="p">,</span> <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">,</span> <span class="n">ngx_errno</span><span class="p">,</span>
+                      <span class="n">ngx_close_file_n</span> <span class="s">" </span><span class="se">\"</span><span class="s">%s</span><span class="se">\"</span><span class="s"> failed"</span><span class="p">,</span> <span class="n">file</span><span class="p">.</span><span class="n">name</span><span class="p">.</span><span class="n">data</span><span class="p">);</span>
+    <span class="p">}</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">n</span> <span class="o">==</span> <span class="n">NGX_ERROR</span><span class="p">)</span> <span class="p">{</span>
+        <span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="k">while</span> <span class="p">(</span><span class="n">n</span><span class="o">--</span> <span class="o">&amp;&amp;</span> <span class="p">(</span><span class="n">buf</span><span class="p">[</span><span class="n">n</span><span class="p">]</span> <span class="o">==</span> <span class="n">CR</span> <span class="o">||</span> <span class="n">buf</span><span class="p">[</span><span class="n">n</span><span class="p">]</span> <span class="o">==</span> <span class="n">LF</span><span class="p">))</span> <span class="p">{</span> <span class="cm">/* void */</span> <span class="p">}</span>
+
+    <span class="n">pid</span> <span class="o">=</span> <span class="n">ngx_atoi</span><span class="p">(</span><span class="n">buf</span><span class="p">,</span> <span class="o">++</span><span class="n">n</span><span class="p">);</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">pid</span> <span class="o">==</span> <span class="p">(</span><span class="n">ngx_pid_t</span><span class="p">)</span> <span class="n">NGX_ERROR</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">ngx_log_error</span><span class="p">(</span><span class="n">NGX_LOG_ERR</span><span class="p">,</span> <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span>
+                      <span class="s">"invalid PID number </span><span class="se">\"</span><span class="s">%*s</span><span class="se">\"</span><span class="s"> in </span><span class="se">\"</span><span class="s">%s</span><span class="se">\"</span><span class="s">"</span><span class="p">,</span>
+                      <span class="n">n</span><span class="p">,</span> <span class="n">buf</span><span class="p">,</span> <span class="n">file</span><span class="p">.</span><span class="n">name</span><span class="p">.</span><span class="n">data</span><span class="p">);</span>
+        <span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="k">return</span> <span class="n">ngx_os_signal_process</span><span class="p">(</span><span class="n">cycle</span><span class="p">,</span> <span class="n">sig</span><span class="p">,</span> <span class="n">pid</span><span class="p">);</span>
+
+<span class="p">}</span>
+</code></pre>
+</div>
+
+<p>而ngx_os_signal_process函數，則會迭代signals數組，找出和傳入的信號字符串一樣的信號，然後用kill對該pid的進程發出對應的終端信號，然後返回1。無論如何，回到main函數後都會馬上退出，因為這種用於處理信號的模式將作用於原有的程序。</p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/core/nginx.c 313~315
+</span>
+<span class="n">ngx_int_t</span>
+<span class="nf">ngx_os_signal_process</span><span class="p">(</span><span class="n">ngx_cycle_t</span> <span class="o">*</span><span class="n">cycle</span><span class="p">,</span> <span class="kt">char</span> <span class="o">*</span><span class="n">name</span><span class="p">,</span> <span class="n">ngx_pid_t</span> <span class="n">pid</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="n">ngx_signal_t</span>  <span class="o">*</span><span class="n">sig</span><span class="p">;</span>
+
+    <span class="k">for</span> <span class="p">(</span><span class="n">sig</span> <span class="o">=</span> <span class="n">signals</span><span class="p">;</span> <span class="n">sig</span><span class="o">-&gt;</span><span class="n">signo</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">sig</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">ngx_strcmp</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">sig</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+            <span class="k">if</span> <span class="p">(</span><span class="n">kill</span><span class="p">(</span><span class="n">pid</span><span class="p">,</span> <span class="n">sig</span><span class="o">-&gt;</span><span class="n">signo</span><span class="p">)</span> <span class="o">!=</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+                <span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+            <span class="p">}</span>
+
+            <span class="n">ngx_log_error</span><span class="p">(</span><span class="n">NGX_LOG_ALERT</span><span class="p">,</span> <span class="n">cycle</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">,</span> <span class="n">ngx_errno</span><span class="p">,</span>
+                          <span class="s">"kill(%P, %d) failed"</span><span class="p">,</span> <span class="n">pid</span><span class="p">,</span> <span class="n">sig</span><span class="o">-&gt;</span><span class="n">signo</span><span class="p">);</span>
+        <span class="p">}</span>
+    <span class="p">}</span>
+
+    <span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre>
+</div>
+
+<p>接下來分析：</p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/core/nginx.c 317~345
+</span>
+    <span class="n">ngx_os_status</span><span class="p">(</span><span class="n">cycle</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">);</span>
+
+    <span class="n">ngx_cycle</span> <span class="o">=</span> <span class="n">cycle</span><span class="p">;</span>
+
+    <span class="n">ccf</span> <span class="o">=</span> <span class="p">(</span><span class="n">ngx_core_conf_t</span> <span class="o">*</span><span class="p">)</span> <span class="n">ngx_get_conf</span><span class="p">(</span><span class="n">cycle</span><span class="o">-&gt;</span><span class="n">conf_ctx</span><span class="p">,</span> <span class="n">ngx_core_module</span><span class="p">);</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">ccf</span><span class="o">-&gt;</span><span class="n">master</span> <span class="o">&amp;&amp;</span> <span class="n">ngx_process</span> <span class="o">==</span> <span class="n">NGX_PROCESS_SINGLE</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">ngx_process</span> <span class="o">=</span> <span class="n">NGX_PROCESS_MASTER</span><span class="p">;</span>
+    <span class="p">}</span>
+
+<span class="cp">#if !(NGX_WIN32)
+</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">ngx_init_signals</span><span class="p">(</span><span class="n">cycle</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">)</span> <span class="o">!=</span> <span class="n">NGX_OK</span><span class="p">)</span> <span class="p">{</span>
+        <span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ngx_inherited</span> <span class="o">&amp;&amp;</span> <span class="n">ccf</span><span class="o">-&gt;</span><span class="n">daemon</span><span class="p">)</span> <span class="p">{</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">ngx_daemon</span><span class="p">(</span><span class="n">cycle</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">)</span> <span class="o">!=</span> <span class="n">NGX_OK</span><span class="p">)</span> <span class="p">{</span>
+            <span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+        <span class="p">}</span>
+
+        <span class="n">ngx_daemonized</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">ngx_inherited</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">ngx_daemonized</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+    <span class="p">}</span>
+
+<span class="cp">#endif
+</span></code></pre>
+</div>
+
+<p>第317行，ngx_os_status()，顯示編譯器和系統特徵的相關信息。</p>
+
+<p>第319行，把初始化得到的在內存池上的cycle指針賦值到ngx_cycle全局變量中。</p>
+
+<p>第321～325行，檢查是否為master模式，如果是則賦值給ngx_process變量。</p>
+
+<p>第329～331行，調用在src/core/ngx_process.c上定義的ngx_init_signals()函數，使用signals信號結構體數組的變量來對信號進行初始化，signals是在該源文件聲明和定義的內部變量，用於存放不同的信號的名稱和執行函數指針等。</p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/os/unix/ngx_process.c 283~306
+</span>
+<span class="n">ngx_int_t</span>
+<span class="nf">ngx_init_signals</span><span class="p">(</span><span class="n">ngx_log_t</span> <span class="o">*</span><span class="n">log</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="n">ngx_signal_t</span>      <span class="o">*</span><span class="n">sig</span><span class="p">;</span>
+    <span class="k">struct</span> <span class="n">sigaction</span>   <span class="n">sa</span><span class="p">;</span>
+
+    <span class="k">for</span> <span class="p">(</span><span class="n">sig</span> <span class="o">=</span> <span class="n">signals</span><span class="p">;</span> <span class="n">sig</span><span class="o">-&gt;</span><span class="n">signo</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">sig</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">ngx_memzero</span><span class="p">(</span><span class="o">&amp;</span><span class="n">sa</span><span class="p">,</span> <span class="k">sizeof</span><span class="p">(</span><span class="k">struct</span> <span class="n">sigaction</span><span class="p">));</span>
+        <span class="n">sa</span><span class="p">.</span><span class="n">sa_handler</span> <span class="o">=</span> <span class="n">sig</span><span class="o">-&gt;</span><span class="n">handler</span><span class="p">;</span>
+        <span class="n">sigemptyset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">sa</span><span class="p">.</span><span class="n">sa_mask</span><span class="p">);</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">sigaction</span><span class="p">(</span><span class="n">sig</span><span class="o">-&gt;</span><span class="n">signo</span><span class="p">,</span> <span class="o">&amp;</span><span class="n">sa</span><span class="p">,</span> <span class="nb">NULL</span><span class="p">)</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+<span class="cp">#if (NGX_VALGRIND)
+</span>            <span class="n">ngx_log_error</span><span class="p">(</span><span class="n">NGX_LOG_ALERT</span><span class="p">,</span> <span class="n">log</span><span class="p">,</span> <span class="n">ngx_errno</span><span class="p">,</span>
+                          <span class="s">"sigaction(%s) failed, ignored"</span><span class="p">,</span> <span class="n">sig</span><span class="o">-&gt;</span><span class="n">signame</span><span class="p">);</span>
+<span class="cp">#else
+</span>            <span class="n">ngx_log_error</span><span class="p">(</span><span class="n">NGX_LOG_EMERG</span><span class="p">,</span> <span class="n">log</span><span class="p">,</span> <span class="n">ngx_errno</span><span class="p">,</span>
+                          <span class="s">"sigaction(%s) failed"</span><span class="p">,</span> <span class="n">sig</span><span class="o">-&gt;</span><span class="n">signame</span><span class="p">);</span>
+            <span class="k">return</span> <span class="n">NGX_ERROR</span><span class="p">;</span>
+<span class="cp">#endif
+</span>        <span class="p">}</span>
+    <span class="p">}</span>
+
+    <span class="k">return</span> <span class="n">NGX_OK</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre>
+</div>
+
+<p>第333～343行，如果不是inherited繼承而來的而且需要daemon守護，則調用src/os/unix/ngx_daemon.c中定義的ngx_daemon()函數。</p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/os/unix/ngx_process.c 333~343
+</span>
+    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">ngx_inherited</span> <span class="o">&amp;&amp;</span> <span class="n">ccf</span><span class="o">-&gt;</span><span class="n">daemon</span><span class="p">)</span> <span class="p">{</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">ngx_daemon</span><span class="p">(</span><span class="n">cycle</span><span class="o">-&gt;</span><span class="n">log</span><span class="p">)</span> <span class="o">!=</span> <span class="n">NGX_OK</span><span class="p">)</span> <span class="p">{</span>
+            <span class="k">return</span> <span class="mi">1</span><span class="p">;</span>
+        <span class="p">}</span>
+
+        <span class="n">ngx_daemonized</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">ngx_inherited</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">ngx_daemonized</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+    <span class="p">}</span>
+</code></pre>
+</div>
+
+<p>守護的是通過fork來實現的，調用fork()函數，如果返回了-1，則fork失敗，返回NGX_ERROR；如果返回0，則fork成功，跳出switch；如果是其它值，必然是操作系統出錯，直接退出程序。</p>
+
+<div class="language-c highlighter-rouge"><pre class="highlight"><code><span class="c1">// src/os/unix/ngx_daemon.c 12~70
+</span>
+<span class="n">ngx_int_t</span>
+<span class="nf">ngx_daemon</span><span class="p">(</span><span class="n">ngx_log_t</span> <span class="o">*</span><span class="n">log</span><span class="p">)</span>
+<span class="p">{</span>
+    <span class="kt">int</span>  <span class="n">fd</span><span class="p">;</span>
+
+    <span class="k">switch</span> <span class="p">(</span><span class="n">fork</span><span class="p">())</span> <span class="p">{</span>
+    <span class="k">case</span> <span class="o">-</span><span class="mi">1</span><span class="p">:</span>
+        <span class="n">ngx_log_error</span><span class="p">(</span><span class="n">NGX_LOG_EMERG</span><span class="p">,</span> <span class="n">log</span><span class="p">,</span> <span class="n">ngx_errno</span><span class="p">,</span> <span class="s">"fork() failed"</span><span class="p">);</span>
+        <span class="k">return</span> <span class="n">NGX_ERROR</span><span class="p">;</span>
+
+    <span class="k">case</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="k">break</span><span class="p">;</span>
+
+    <span class="nl">default:</span>
+        <span class="n">exit</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span>
+    <span class="p">}</span>
+
+    <span class="n">ngx_pid</span> <span class="o">=</span> <span class="n">ngx_getpid</span><span class="p">();</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">setsid</span><span class="p">()</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">ngx_log_error</span><span class="p">(</span><span class="n">NGX_LOG_EMERG</span><span class="p">,</span> <span class="n">log</span><span class="p">,</span> <span class="n">ngx_errno</span><span class="p">,</span> <span class="s">"setsid() failed"</span><span class="p">);</span>
+        <span class="k">return</span> <span class="n">NGX_ERROR</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="n">umask</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span>
+
+    <span class="n">fd</span> <span class="o">=</span> <span class="n">open</span><span class="p">(</span><span class="s">"/dev/null"</span><span class="p">,</span> <span class="n">O_RDWR</span><span class="p">);</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">fd</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">ngx_log_error</span><span class="p">(</span><span class="n">NGX_LOG_EMERG</span><span class="p">,</span> <span class="n">log</span><span class="p">,</span> <span class="n">ngx_errno</span><span class="p">,</span>
+                      <span class="s">"open(</span><span class="se">\"</span><span class="s">/dev/null</span><span class="se">\"</span><span class="s">) failed"</span><span class="p">);</span>
+        <span class="k">return</span> <span class="n">NGX_ERROR</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">dup2</span><span class="p">(</span><span class="n">fd</span><span class="p">,</span> <span class="n">STDIN_FILENO</span><span class="p">)</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">ngx_log_error</span><span class="p">(</span><span class="n">NGX_LOG_EMERG</span><span class="p">,</span> <span class="n">log</span><span class="p">,</span> <span class="n">ngx_errno</span><span class="p">,</span> <span class="s">"dup2(STDIN) failed"</span><span class="p">);</span>
+        <span class="k">return</span> <span class="n">NGX_ERROR</span><span class="p">;</span>
+    <span class="p">}</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="n">dup2</span><span class="p">(</span><span class="n">fd</span><span class="p">,</span> <span class="n">STDOUT_FILENO</span><span class="p">)</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">ngx_log_error</span><span class="p">(</span><span class="n">NGX_LOG_EMERG</span><span class="p">,</span> <span class="n">log</span><span class="p">,</span> <span class="n">ngx_errno</span><span class="p">,</span> <span class="s">"dup2(STDOUT) failed"</span><span class="p">);</span>
+        <span class="k">return</span> <span class="n">NGX_ERROR</span><span class="p">;</span>
+    <span class="p">}</span>
+
+<span class="c">#if 0
+    if (dup2(fd, STDERR_FILENO) == -1) {
+        ngx_log_error(NGX_LOG_EMERG, log, ngx_errno, "dup2(STDERR) failed");
+        return NGX_ERROR;
+    }
+#endif
+</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">fd</span> <span class="o">&gt;</span> <span class="n">STDERR_FILENO</span><span class="p">)</span> <span class="p">{</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">close</span><span class="p">(</span><span class="n">fd</span><span class="p">)</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+            <span class="n">ngx_log_error</span><span class="p">(</span><span class="n">NGX_LOG_EMERG</span><span class="p">,</span> <span class="n">log</span><span class="p">,</span> <span class="n">ngx_errno</span><span class="p">,</span> <span class="s">"close() failed"</span><span class="p">);</span>
+            <span class="k">return</span> <span class="n">NGX_ERROR</span><span class="p">;</span>
+        <span class="p">}</span>
+    <span class="p">}</span>
+
+    <span class="k">return</span> <span class="n">NGX_OK</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre>
+</div>
