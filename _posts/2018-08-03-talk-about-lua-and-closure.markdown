@@ -2,7 +2,7 @@
 layout: post
 title:  "聊聊lua和closure"
 date:   2018-08-03 22:00:00 +0800
-categories: 浅谈
+categories: 浅谈感想
 ---
 
 ### 聊聊Lua
