@@ -1,4 +1,11 @@
-三年skynet有感——基于Actor模型理念的事件驱动的并行并发框架
+---
+layout: post
+title:  "三年skynet有感——基于Actor模型理念的事件驱动的并行并发框架"
+date:   2020-01-09 22:00:00 +0800
+categories: 代码分析
+---
+
+基于Actor模型理念的事件驱动的并行并发框架
 
 符合Actor模型，是skynet很重要的特征。在Actor模型中，每个Actor都是一个最基本的计算单元，其内部对外是一个黑箱，Actor不接受外部的“调用”，但Actor可以接收外部的Message，和向其它Actor发送Message。虽然作者不怎么说skynet借鉴了Actor模型的思想，但事实上，每个skynet的service，它的功能都相当于一个独立的Actor，“service可以向skynet框架注册一个callback函数，用来接收发给它的消息”，但service和service之间，并没有办法可以直接调用，因为每个service都是一个独立的。
 
