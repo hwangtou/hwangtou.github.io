@@ -1,0 +1,122 @@
+---
+layout: post
+title:  "用Go语言写个简单的消息队列——设计理念和用法介绍"
+date:   2019-12-16 22:00:00 +0800
+categories: 搞个想法
+---
+
+为什么想要用Go写一个消息队列工具？满足重造车轮的癖好？不全是！
+
+回归初心，消息队列是用于程序间发送消息的异步队列。而目前主流的MQ的中间件，都把MQ太复杂化。而我编写的消息队列，主要是为了解决以下问题：
+
+1. 不依赖外部进程。大部分的MQ中间件应用，都是独立运行的，程序还需要连接到MQ来获取消息队列，而在程序规模不大的情况下，这显得不太必要。其实消息队列，作为一种类似应用的信箱的机制，这大可以内置到应用的内部。
+2. 无需独立运维。RabbitMQ等MQ虽好，但毕竟运行在独立的进程，对于简单的项目来说，需要额外地管理一个中间件的进程，这对于小型的项目比较麻烦。而如果应用内部就集成MQ的功能，那当应用启动的时候，内置的MQ也同时启动，省去管理和运维的麻烦。
+3. 蝇量级。实际上，大型的MQ应用，它们的功能清单看起来很全面，也很吸引，但在实际开发中，我们反而希望工具可以提供少一点功能，因为大部分项目都只会用到这些MQ应用的部分功能，那么，多余的功能则显得是很累赘。我们在开始的时候幻想完美和全面，但实际入手，却发现简单是美。
+4. TCP复用。也许有人会说，Go的库就提供了RPC的支持，难道这不香？貌似我们也可以把其当成一种MQ来使用，但阅读起源码，本质上还是对Go的net库的一种封装，而每个RPC的调用，都需要创建一个独立的TCP连接，而且无法复用。实际上这不利于执行大批量的RPC，因为大量的TCP的Conn和Accept，实际上还是会对性能造成影响的，而且也会消耗时间。
+
+开发功能：
+1. 集群内的MQ自动连接管理
+2. MQ的连接和监听自动重连机制
+3. MQ的连接Token认证机制
+4. MQ的时序性保证
+暂不开发：
+1. 发送失败的消息补发机制：当发送出现问题，则判定该MQ的Conn是有问题的，马上断开该Conn，并马上告诉发送者发送失败，让发送的业务自行作重发的逻辑处理。
+
+创建配置并启动
+1. 配置MQ的Config
+    1. Name：当前队列的名称
+    2. Queues：集群中所有会互相连接的队列的信息，包含自身和其它队列的信息，MQ启动后会自动连接。其中，key是MQ的队列名称，value是MQ的队列地址。
+    3. AuthToken：验证用的token，所有能互现连接的MQ的token必须相同，token可以为空字符串。
+    4. AutoReconnect：当连接失败时，是否自动重连。
+    5. AutoReconnectDuration：如果自动重连，重连间隔的时长为多少。
+    6. ReadBufferSize：配置net.Conn的Read缓冲区大小，不可为0，否则会出现问题。建议值为4096。
+    7. ReadTimeout：配置net.Conn的读超时时长，建议为0，为0时则没有超时时间。
+    8. WriteTimeout：配置net.Conn的写超时时长，建议为0，为0时则没有超时时间。
+    9. PacketSizeLimit：MQ的包体积限制，当接收到的包头中，包大小信息大于这个限制的时候，该连接会被断开。如果有超出这个配置的包大小的内容需要传输，应考虑业务层的分包，或者考虑修改对包大小的限制值。这是用于保护接收到有问题的包时，MQ不会因为包头的包体大小过大，而浪费过多内存。这也能保护MQ，避免恶意MQ连入后，策动的类似DDoS的攻击，耗尽内存资源。
+    10. PacketWaitTimeout：MQ发送包的默认超时时间。
+    11. ListenerDaemon：是否守护MQ的监听地址的监听状态，以确保可用。
+    12. ListenerDaemonRetryDuration：若守护发现MQ的监听出现问题，重新尝试监听的间隔。
+
+```Go
+config := Config{
+   Name:                        "name1",
+   Queues:                      map[string]string{
+      "name1": "127.0.0.1:20001",
+      "name2": "127.0.0.1:20002",
+   },
+   AuthToken:                   "test_token",
+   AutoReconnect:               true,
+   AutoReconnectDuration:       3 * time.Second,
+   ReadBufferSize:              1024,
+   ReadTimeout:                 0,
+   WriteTimeout:                0,
+   PacketSizeLimit:             1048576,
+   PacketWaitTimeout:           5 * time.Second,
+   ListenerDaemon:              true,
+   ListenerDaemonRetryDuration: 3 * time.Second,
+}
+```
+
+2. 实现MQ的观察者接口MqWatcher
+    1. ConnStateChanged()：连接状态改变通知，当state为OutConnConnected，表明该对外连接可用。
+    2. NewPacket()：新包通知，为了确保进入包的顺序，MQ调用该方法时并没有创建goroutine，也就是说，新包是通过串行的调用，逐个通知监听者的。因此，请不要堵塞此回调接口，同时，如果包没有问题，请返回AckOK，否则则返回AckError，而AckError会触发MQ断开lian jie，因为该MQ的Conn被视为不可信。
+
+```Go
+type watcher struct {}
+
+func (m *watcher) NewPacket(name string, packet *Packet) Ack {
+   go func() {
+      // Don’t block here
+   }()
+   return AckOK
+}
+
+func (m *watcher) ConnStateChanged(name string, state OutConnState) {
+   if state == OutConnConnected {
+      // TODO
+   }
+}
+```
+
+3. 初始化MQ实例并启动
+
+```Go
+m := &mq.Manager{}
+m.Init(&watcher{}, config)
+m.Start()
+defer m.ForceStop()
+// Wait until app is going to terminate
+```
+
+1. 调用Send函数发送消息，第一参数为对方队列名称，第二参数为数据内容，并返回error。返回error的可能为：
+    * nil：发送成功。
+    * errMqOutClosed：MQ的Conn还未连接成功。
+    * errMqOutSendTimeout：MQ的发送时间超时之后，还未收到对方MQ的Ack包。
+    * errAckUnAuth：和对方MQ的连接处于未验证状态的发送失败，会触发与对方MQ的Conn的断开。
+    * errAckError：对方MQ返回包错误，会触发与对方MQ的Conn的断开。
+    * errAckUnknown：对方MQ返回未知错误，会触发与对方MQ的Conn的断开。
+    * net.Conn的写入超时和写入失败错误。
+
+```Go
+err := m.Send(“name2”, []byte(“Hello world”)
+```
+
+定义
+1. 提供一个名称和一个地址，即可创建一个消息队列。
+
+MessageQueue生命周期：
+1. 调用newMessageQueue()函数获取消息队列的实例。
+2. 调用消息队列实例的startListen(address, handlerFunc)方法来开始运行一个消息队列，并开始监听。
+    1. 首先，会对传入的对方队列地址address尝试进行连接，如果失败则终止并返回。
+    2. NO:创建一个消息管道channel，并创建一个goroutine来处理新进的消息。
+    3. 创建一个goroutine来轮询等待listener的新连接。每个接到的新连接，都创建一个goroutine来处理连接conn的消息读取。
+        1. for循环中有一个匿名goroutine闭包，每次进入for循环即会执行，负责从每次的Accept中，把有效的连接conn对象，传入到acceptedConnCh管道中。
+        2. 此时，for循环下面的select语句正在堵塞等待acceptedConnCh管道和closeCh管道的消息传入。若acceptedConnCh有新的conn传入，开启新的goroutine处理并进入下个for循环；若closeCh有消息传入，那则是closeCh的close消息，意味着要退出监听，退出整个函数。
+        3. 不必担心这个goroutine闭包会悬空，因为当stop()方法被调用，select会进入m.closeCh条件，for循环会结束并导致函数defer执行，此时listener会被Close。只要当listener被关闭，Accept会返回错误，从而闭包函数会打印错误日志并返回，goroutine结束。
+3. 调用消息队列实例的stopListener()方法以停止监听。
+    1. 通过关闭closeCh管道，让startListen()方法中的轮询listener的goroutine退出。
+4. 调用消息队列实例的stopConnections()放来以关闭所有连接。
+    1. conn和listener的情况不同，conn可以直接通过Close关闭
+
+MessageQueue TODO：
+1. 需要考虑处理的情况是，如果本机listen的网卡状态出现了变动，会出现什么问题，以及这种情况下该如何恢复节点可用。
